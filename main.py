@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import QApplication
 
 from app.config import Settings
 from app.constants import APP_NAME, APP_ORG, APP_VERSION
+from app.core import ProviderManager
 from app.ui import MainWindow
 
 
@@ -22,7 +23,8 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     settings = Settings()
-    window = MainWindow(settings)
+    manager = ProviderManager(settings)
+    window = MainWindow(settings, manager)
     window.show()
 
     return app.exec()

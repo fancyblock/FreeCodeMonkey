@@ -17,30 +17,24 @@ class Settings:
     def __init__(self, qsettings: QSettings | None = None) -> None:
         self._q = qsettings if qsettings is not None else QSettings(APP_ORG, APP_NAME)
 
-    # ---- LLM 配置 ----
+    # ---- Provider 管理 ----
     @property
-    def provider(self) -> str:
-        return self._q.value("llm/provider", "echo", str)
+    def providers_json(self) -> str:
+        """已保存的 provider 列表（JSON 字符串）。"""
+        return self._q.value("llm/providers_json", "[]", str)
 
-    @provider.setter
-    def provider(self, value: str) -> None:
-        self._q.setValue("llm/provider", value)
-
-    @property
-    def api_key(self) -> str:
-        return self._q.value("llm/api_key", "", str)
-
-    @api_key.setter
-    def api_key(self, value: str) -> None:
-        self._q.setValue("llm/api_key", value)
+    @providers_json.setter
+    def providers_json(self, value: str) -> None:
+        self._q.setValue("llm/providers_json", value)
 
     @property
-    def model(self) -> str:
-        return self._q.value("llm/model", "", str)
+    def active_provider_id(self) -> str:
+        """当前选中的 provider ID。"""
+        return self._q.value("llm/active_provider_id", "", str)
 
-    @model.setter
-    def model(self, value: str) -> None:
-        self._q.setValue("llm/model", value)
+    @active_provider_id.setter
+    def active_provider_id(self, value: str) -> None:
+        self._q.setValue("llm/active_provider_id", value)
 
     # ---- 窗口状态 ----
     @property
