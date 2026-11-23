@@ -14,12 +14,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 
 from app.agent import AgentRuntime, ApprovalDecision, ApprovalRequest, Workspace
 from app.agent import events as E
+from app.agent.runtime import (
+    COMPACT_KEEP_CHARS,
+    compact_messages,
+    estimate_tokens,
+    message_chars,
+)
 
 
 class ScriptedChatModel(BaseChatModel):
@@ -28,6 +34,7 @@ class ScriptedChatModel(BaseChatModel):
     responses: list = Field(default_factory=list)
     calls: int = 0
     received_tools: list = Field(default_factory=list)
+    received_messages: list = Field(default_factory=list)
 
     @property
     def _llm_type(self) -> str:
@@ -42,6 +49,7 @@ class ScriptedChatModel(BaseChatModel):
         return self
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # noqa: ANN001
+        self.received_messages.append(list(messages))
         index = min(self.calls, len(self.responses) - 1)
         self.calls += 1
         return ChatResult(generations=[ChatGeneration(message=self.responses[index])])
@@ -100,7 +108,7 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(model.calls, 1)
         self.assertEqual(len(result), 2)  # HumanMessage + AIMessage
         kinds = [event.kind for event in self.events]
-        self.assertEqual(kinds, [E.STEP, E.DONE])
+        self.assertEqual(kinds, [E.STEP, E.CONTEXT, E.DONE])
         self.assertIn("你好", self.events[-1].text)
 
     def test_tools_are_registered(self) -> None:
@@ -108,6 +116,137 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(len(model.received_tools), 1)
         names = [schema["function"]["name"] for schema in model.received_tools[0]]
         self.assertEqual(names, ["read_file", "list_dir", "grep", "edit_file", "run_command"])
+
+    # ---- Plan / Build 模式 ----
+    def test_plan_mode_only_exposes_read_tools(self) -> None:
+        workspace = Workspace(self.root, read_only=True)
+        model = ScriptedChatModel(responses=[AIMessage(content="计划如下…")])
+        runtime = AgentRuntime(model, workspace, AllowAll(), mode="plan")
+        runtime.run("先看看代码再给计划", [], self.events.append)
+
+        names = [schema["function"]["name"] for schema in model.received_tools[0]]
+        self.assertEqual(names, ["read_file", "list_dir", "grep"])
+        # 用的是 Plan 提示词，而不是 Build 的
+        system = model.received_messages[0][0]
+        self.assertIn("Plan 模式", system.content)
+        self.assertIn("只读", system.content)
+
+    def test_plan_mode_blocks_write_tools_even_if_exposed(self) -> None:
+        approval = AllowAll()
+        model = ScriptedChatModel(
+            responses=[
+                tool_call(
+                    "edit_file",
+                    {"path": "src/app.py", "old_string": 'return "bye"', "new_string": 'return "cya"'},
+                    "c1",
+                ),
+                AIMessage(content="请切到 Build 模式执行。"),
+            ]
+        )
+        runtime = AgentRuntime(model, self.workspace, approval, mode="plan")
+        result = runtime.run("改掉 farewell", [], self.events.append)
+
+        tool_messages = [m for m in result if isinstance(m, ToolMessage)]
+        self.assertIn("Plan 模式", tool_messages[0].content)
+        self.assertEqual(approval.requests, [])
+        self.assertIn('return "bye"', (self.root / "src" / "app.py").read_text(encoding="utf-8"))
+
+    def test_unknown_mode_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            AgentRuntime(ScriptedChatModel(), self.workspace, AllowAll(), mode="hack")
+
+    # ---- 上下文预算 ----
+    def _tool_round(self, index: int, size: int) -> list:
+        call_id = f"c{index}"
+        return [
+            tool_call("read_file", {"path": "big.txt"}, call_id),
+            ToolMessage(content="x" * size, tool_call_id=call_id),
+        ]
+
+    def test_compact_messages_noop_under_budget(self) -> None:
+        messages = [HumanMessage(content="hi"), AIMessage(content="ok")]
+        self.assertEqual(compact_messages(messages, budget=1_000), messages)
+
+    def test_compact_messages_replaces_oldest_tool_outputs(self) -> None:
+        messages: list = [HumanMessage(content="任务")]
+        for index in range(3):
+            messages.extend(self._tool_round(index, 8_000))
+
+        compacted = compact_messages(messages, budget=10_000)
+
+        self.assertEqual(len(compacted), len(messages))
+        tools = [m for m in compacted if isinstance(m, ToolMessage)]
+        self.assertTrue(tools[0].content.startswith("（早前工具输出已省略"))
+        self.assertTrue(tools[1].content.startswith("（早前工具输出已省略"))
+        self.assertEqual(tools[2].content, "x" * 8_000)
+        self.assertEqual([m.tool_call_id for m in tools], ["c0", "c1", "c2"])
+        self.assertLessEqual(sum(message_chars(m) for m in compacted), 10_000)
+
+    def test_compact_messages_keeps_tool_pairing(self) -> None:
+        messages: list = [HumanMessage(content="任务")]
+        for index in range(3):
+            messages.extend(self._tool_round(index, 8_000))
+
+        compacted = compact_messages(messages, budget=10_000)
+        call_ids = {
+            call["id"]
+            for message in compacted
+            if isinstance(message, AIMessage)
+            for call in (message.tool_calls or [])
+        }
+        for message in compacted:
+            if isinstance(message, ToolMessage):
+                self.assertIn(message.tool_call_id, call_ids)
+
+    def test_runtime_compacts_between_steps(self) -> None:
+        (self.root / "big.txt").write_text(
+            "\n".join("y" * 60 for _ in range(400)), encoding="utf-8"
+        )
+        model = ScriptedChatModel(
+            responses=[
+                tool_call("read_file", {"path": "big.txt"}, "c1"),
+                tool_call("read_file", {"path": "big.txt"}, "c2"),
+                tool_call("read_file", {"path": "big.txt"}, "c3"),
+                AIMessage(content="读完了。"),
+            ]
+        )
+        runtime = AgentRuntime(
+            model, self.workspace, AllowAll(), context_budget=20_000
+        )
+        result = runtime.run("把 big.txt 读三遍", [], self.events.append)
+
+        self.assertLessEqual(sum(message_chars(m) for m in result), 20_000)
+        tools = [m for m in result if isinstance(m, ToolMessage)]
+        self.assertEqual(len(tools), 3)
+        self.assertTrue(
+            any(str(m.content).startswith("（早前工具输出已省略") for m in tools)
+        )
+        self.assertGreater(len(str(tools[-1].content)), COMPACT_KEEP_CHARS)
+
+    # ---- 上下文占用事件 ----
+    def test_estimate_tokens_handles_cjk(self) -> None:
+        self.assertEqual(estimate_tokens("abcd"), 1.0)
+        self.assertEqual(estimate_tokens("你好"), 2.0)
+        self.assertEqual(estimate_tokens("你好ab"), 2.5)
+        self.assertEqual(estimate_tokens(""), 0.0)
+
+    def test_runtime_emits_context_usage(self) -> None:
+        model = ScriptedChatModel(
+            responses=[
+                tool_call("read_file", {"path": "notes.txt"}, "c1"),
+                AIMessage(content="ok"),
+            ]
+        )
+        runtime = AgentRuntime(
+            model, self.workspace, AllowAll(), context_window=100_000
+        )
+        runtime.run("看看 notes", [], self.events.append)
+
+        contexts = [event for event in self.events if event.kind == E.CONTEXT]
+        self.assertEqual(len(contexts), 2)
+        self.assertTrue(all(event.window_tokens == 100_000 for event in contexts))
+        self.assertGreater(contexts[0].used_tokens, 0)
+        self.assertGreater(contexts[1].used_tokens, contexts[0].used_tokens)
 
     # ---- 完整闭环 ----
     def test_read_then_edit_then_confirm(self) -> None:
@@ -199,7 +338,12 @@ class AgentLoopTest(unittest.TestCase):
         )
         tool_messages = [m for m in result if isinstance(m, ToolMessage)]
         self.assertIn("超出工作区", tool_messages[0].content)
-        self.assertTrue(self.events[2].ok is False)
+        failed_results = [
+            event
+            for event in self.events
+            if event.kind == E.TOOL_RESULT and not event.ok
+        ]
+        self.assertEqual(len(failed_results), 1)
 
     def test_ambiguous_edit_fails_clearly(self) -> None:
         _, result = self.run_agent(

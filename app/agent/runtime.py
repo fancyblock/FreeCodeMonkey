@@ -23,15 +23,20 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from app.constants import DEFAULT_CONTEXT_WINDOW
+
 from . import events as E
 from .approval import ApprovalChannel, ApprovalDecision, ApprovalRequest
 from .events import AgentEvent
-from .prompts import SYSTEM_PROMPT
+from .prompts import PROMPTS
 from .tools import Workspace
 
 MAX_STEPS = 25
 HISTORY_LIMIT = 40
 EVENT_PREVIEW_CHARS = 500
+CONTEXT_CHAR_BUDGET = 40_000
+COMPACT_KEEP_CHARS = 4_000
+COMPACT_PLACEHOLDER = "（早前工具输出已省略"
 
 
 def content_text(content: Any) -> str:
@@ -64,6 +69,120 @@ def trim_history(messages: list[BaseMessage], limit: int = HISTORY_LIMIT) -> lis
     while trimmed and not isinstance(trimmed[0], (HumanMessage, AIMessage)):
         trimmed.pop(0)
     return trimmed
+
+
+def message_chars(message: BaseMessage) -> int:
+    """估算一条消息占用的字符数：正文 + AIMessage 的工具参数。"""
+    size = len(content_text(message.content))
+    for call in getattr(message, "tool_calls", None) or []:
+        args = call.get("args") if isinstance(call, dict) else None
+        if args is None:
+            continue
+        try:
+            size += len(json.dumps(args, ensure_ascii=False))
+        except (TypeError, ValueError):
+            size += len(str(args))
+    return size
+
+
+def estimate_tokens(text: str) -> float:
+    """粗略估算 token 数：CJK 字符约 1 token/字，其余约 4 字符/token。"""
+    cjk = 0
+    for char in text:
+        code = ord(char)
+        if (
+            0x4E00 <= code <= 0x9FFF      # CJK 统一表意文字
+            or 0x3000 <= code <= 0x303F   # CJK 标点
+            or 0xFF00 <= code <= 0xFFEF   # 全角字符
+        ):
+            cjk += 1
+    return cjk + (len(text) - cjk) / 4
+
+
+def message_tokens(message: BaseMessage) -> float:
+    """估算一条消息的 token 数：正文 + AIMessage 的工具参数。"""
+    total = estimate_tokens(content_text(message.content))
+    for call in getattr(message, "tool_calls", None) or []:
+        args = call.get("args") if isinstance(call, dict) else None
+        if args is None:
+            continue
+        try:
+            raw = json.dumps(args, ensure_ascii=False)
+        except (TypeError, ValueError):
+            raw = str(args)
+        total += estimate_tokens(raw)
+    return total
+
+
+def _placeholder(size: int) -> str:
+    return f"{COMPACT_PLACEHOLDER}：原 {size} 字符。需要时请重新调用相应工具。）"
+
+
+def _clip_middle(text: str, limit: int = COMPACT_KEEP_CHARS) -> str:
+    """保留头尾、省略中间，用于兜底裁剪仍然过大的工具结果。"""
+    if len(text) <= limit:
+        return text
+    head = limit * 2 // 5
+    tail = limit - head
+    removed = len(text) - limit
+    return f"{text[:head]}\n\n...（已省略 {removed} 个字符）...\n\n{text[-tail:]}"
+
+
+def compact_messages(
+    messages: list[BaseMessage],
+    budget: int = CONTEXT_CHAR_BUDGET,
+) -> list[BaseMessage]:
+    """把消息正文压到字符预算内：只替换工具输出，不删除任何消息。
+
+    保留全部消息与顺序，因此 tool_calls / ToolMessage 的配对始终合法。
+    第一遍从最旧的工具结果开始替换成占位行；仍超预算时再对较新的
+    工具结果做头尾裁剪。被省略的输出可以靠模型重新调用工具取回。
+    """
+    if budget <= 0:
+        return messages
+    total = sum(message_chars(message) for message in messages)
+    if total <= budget:
+        return messages
+
+    compacted = list(messages)
+    for index, message in enumerate(compacted):
+        if total <= budget:
+            break
+        if not isinstance(message, ToolMessage):
+            continue
+        text = content_text(message.content)
+        if text.startswith(COMPACT_PLACEHOLDER):
+            continue
+        placeholder = _placeholder(len(text))
+        saving = len(text) - len(placeholder)
+        if saving <= 0:
+            continue
+        compacted[index] = ToolMessage(
+            content=placeholder,
+            tool_call_id=message.tool_call_id,
+            name=getattr(message, "name", None),
+        )
+        total -= saving
+
+    for index, message in enumerate(compacted):
+        if total <= budget:
+            break
+        if not isinstance(message, ToolMessage):
+            continue
+        text = content_text(message.content)
+        if text.startswith(COMPACT_PLACEHOLDER):
+            continue
+        clipped = _clip_middle(text)
+        if len(clipped) >= len(text):
+            continue
+        compacted[index] = ToolMessage(
+            content=clipped,
+            tool_call_id=message.tool_call_id,
+            name=getattr(message, "name", None),
+        )
+        total -= len(text) - len(clipped)
+
+    return compacted
 
 
 def _is_error(result: str) -> bool:
@@ -103,12 +222,24 @@ class AgentRuntime:
         workspace: Workspace,
         approval: ApprovalChannel,
         max_steps: int = MAX_STEPS,
+        mode: str = "build",
+        context_budget: int = CONTEXT_CHAR_BUDGET,
+        context_window: int = DEFAULT_CONTEXT_WINDOW,
     ) -> None:
+        if mode not in PROMPTS:
+            raise ValueError(f"未知的 agent 模式：{mode}，可选：{'、'.join(PROMPTS)}")
         self._model = model
         self._workspace = workspace
         self._approval = approval
         self._max_steps = max_steps
+        self._mode = mode
+        self._context_budget = context_budget
+        self._context_window = context_window if context_window > 0 else DEFAULT_CONTEXT_WINDOW
         self._cancelled = False
+
+    @property
+    def mode(self) -> str:
+        return self._mode
 
     def cancel(self) -> None:
         """请求停止：只在两个步骤之间生效，不打断正在执行的命令。"""
@@ -123,16 +254,20 @@ class AgentRuntime:
     ) -> list[BaseMessage]:
         """执行任务，返回本轮完整消息序列（不含 system），供后续对话复用。"""
         emit = on_event or (lambda event: None)
+        prompt = PROMPTS[self._mode]
+        system_text = prompt.format(
+            root=self._workspace.root.as_posix(),
+            platform=f"{platform.system()} {platform.release()} · Python {platform.python_version()}",
+        )
         messages: list[BaseMessage] = [
-            SystemMessage(
-                content=SYSTEM_PROMPT.format(
-                    root=self._workspace.root.as_posix(),
-                    platform=f"{platform.system()} {platform.release()} · Python {platform.python_version()}",
-                )
-            ),
+            SystemMessage(content=system_text),
             *trim_history(list(history or [])),
             HumanMessage(content=task),
         ]
+        # system prompt 与工具 schema 每轮固定，先算一次作为占用基线
+        base_tokens = estimate_tokens(system_text) + estimate_tokens(
+            json.dumps(self._workspace.schemas(), ensure_ascii=False)
+        )
         bound = self._bind_tools()
 
         for step in range(1, self._max_steps + 1):
@@ -141,6 +276,18 @@ class AgentRuntime:
                 return messages[1:]
 
             emit(AgentEvent(E.STEP, step=step, text=f"第 {step} 步"))
+
+            # 每步调用模型前按字符预算压缩旧工具输出，避免单轮任务撑爆上下文
+            messages = compact_messages(messages, self._context_budget)
+            used_tokens = base_tokens + sum(message_tokens(m) for m in messages)
+            emit(
+                AgentEvent(
+                    E.CONTEXT,
+                    step=step,
+                    used_tokens=int(used_tokens),
+                    window_tokens=self._context_window,
+                )
+            )
 
             try:
                 reply = bound.invoke(messages)
@@ -208,6 +355,11 @@ class AgentRuntime:
         if tool is None:
             available = "、".join(t.name for t in self._workspace.tools())
             result = f"错误：工具 {name} 不存在。可用工具：{available}"
+        elif self._mode == "plan" and tool.requires_approval:
+            result = (
+                "错误：Plan 模式只读，不能修改文件或执行命令。"
+                "请把修改计划交给用户，由用户切到 Build 模式执行。"
+            )
         elif tool.requires_approval:
             decision = self._ask(name, args)
             if not decision.allowed:

@@ -29,11 +29,11 @@ from app.agent import AgentEvent, AgentRuntime, Workspace
 from app.agent import events as E
 from app.agent.runtime import summarize_call, trim_history
 from app.config import Settings
-from app.constants import APP_NAME, APP_VERSION
+from app.constants import APP_NAME, APP_VERSION, DEFAULT_CONTEXT_WINDOW
 from app.core import ProviderManager, get_spec
 from app.ui.agent_bridge import AgentBridge
 from app.ui.dialogs import SettingsDialog
-from app.ui.widgets import ChatView, PromptInput
+from app.ui.widgets import ChatView, PromptInput, PromptList
 from app.workers import release_handle, run_in_thread
 
 
@@ -54,6 +54,7 @@ class MainWindow(QMainWindow):
 
         self._chat_view = ChatView()
         self._prompt_input = PromptInput()
+        self._prompt_list = PromptList()
         self._provider_combo = QComboBox()
         self._workspace_label = QLabel()
 
@@ -90,12 +91,21 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 1)
 
+        # 左侧提示词列表横跨对话区与输入框；窗口变窄时优先压缩对话区
+        body = QSplitter(Qt.Orientation.Horizontal)
+        body.addWidget(self._prompt_list)
+        body.addWidget(splitter)
+        body.setStretchFactor(0, 0)
+        body.setStretchFactor(1, 1)
+        body.setCollapsible(0, False)
+        body.setSizes([200, 820])
+
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addLayout(provider_bar)
         layout.addLayout(workspace_bar)
-        layout.addWidget(splitter)
+        layout.addWidget(body)
         self.setCentralWidget(container)
 
         self.statusBar().showMessage("就绪")
@@ -132,6 +142,7 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self._prompt_input.submitted.connect(self._on_submit)
         self._prompt_input.stop_requested.connect(self._on_stop)
+        self._prompt_list.prompt_activated.connect(self._jump_to_prompt)
         self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
 
     # ---- Provider ----
@@ -158,6 +169,7 @@ class MainWindow(QMainWindow):
 
         has_provider = len(configs) > 0
         self._prompt_input.setDisabled(not has_provider)
+        self._prompt_input.set_context_window(self._active_context_window())
         if has_provider:
             self.statusBar().showMessage("就绪")
         else:
@@ -168,6 +180,11 @@ class MainWindow(QMainWindow):
         provider_id = self._provider_combo.itemData(index)
         if provider_id:
             self._manager.active_id = str(provider_id)
+            self._prompt_input.set_context_window(self._active_context_window())
+
+    def _active_context_window(self) -> int:
+        config = self._manager.active_config
+        return config.context_window if config is not None else DEFAULT_CONTEXT_WINDOW
 
     # ---- 工作区 ----
     def _initial_workspace(self) -> Path:
@@ -241,8 +258,9 @@ class MainWindow(QMainWindow):
             self._chat_view.append_system("请先添加并选择一个 LLM Provider。")
             return
 
+        mode = self._prompt_input.mode()
         try:
-            workspace = Workspace(self._workspace_root)
+            workspace = Workspace(self._workspace_root, read_only=(mode == "plan"))
         except ValueError as exc:
             self._chat_view.append_system(f"工作区不可用：{exc}")
             return
@@ -257,14 +275,21 @@ class MainWindow(QMainWindow):
             self._chat_view.append_system("上一个任务还在执行，请先停止或等待完成。")
             return
 
-        self._chat_view.append_message("user", task)
+        mark = self._chat_view.append_message("user", task)
+        self._prompt_list.add_prompt(task, mark)
         self._prompt_input.clear()
         self._prompt_input.set_running(True)
-        self.statusBar().showMessage(f"正在调用 {config.name} …")
+        self.statusBar().showMessage(f"正在调用 {config.name}（{mode}）…")
 
         bridge = AgentBridge(self)
         bridge.agent_event.connect(self._on_agent_event)
-        runtime = AgentRuntime(model, workspace, bridge)
+        runtime = AgentRuntime(
+            model,
+            workspace,
+            bridge,
+            mode=mode,
+            context_window=config.context_window,
+        )
         self._bridge = bridge
         self._runtime = runtime
 
@@ -297,6 +322,8 @@ class MainWindow(QMainWindow):
         elif kind == E.DENIED:
             self._chat_view.append_step(f"✗ 已拒绝 {event.tool}", event.text, "bad")
             self.statusBar().showMessage("你拒绝了一个操作")
+        elif kind == E.CONTEXT:
+            self._prompt_input.set_context_usage(event.used_tokens, event.window_tokens)
         elif kind == E.DONE:
             self._chat_view.append_message("assistant", event.text)
             self.statusBar().showMessage("就绪")
@@ -322,6 +349,11 @@ class MainWindow(QMainWindow):
         """只复位界面状态；句柄要等线程真正结束再由 _on_thread_finished 释放。"""
         self._prompt_input.set_running(False)
         self.statusBar().showMessage(status)
+
+    @pyqtSlot(str)
+    def _jump_to_prompt(self, mark: str) -> None:
+        """把对话区滚动到该提示词的消息处并高亮。"""
+        self._chat_view.scroll_to_mark(mark)
 
     @pyqtSlot()
     def _on_thread_finished(self) -> None:
@@ -349,6 +381,8 @@ class MainWindow(QMainWindow):
             self._chat_view.append_system("任务执行中，无法清空对话。")
             return
         self._history.clear()
+        self._prompt_list.clear_prompts()
+        self._prompt_input.reset_context()
         self._chat_view.clear_history()
 
     def _open_settings(self) -> None:

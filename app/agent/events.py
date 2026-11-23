@@ -15,6 +15,7 @@ THOUGHT = "thought"          # 模型的中间说明文字
 TOOL_CALL = "tool_call"      # 即将执行某个工具
 TOOL_RESULT = "tool_result"  # 工具执行完成
 DENIED = "denied"            # 用户拒绝了某个工具调用
+CONTEXT = "context"          # 本次请求的上下文占用
 DONE = "done"                # 任务结束，附最终回答
 ERROR = "error"              # 任务失败
 
@@ -29,3 +30,5 @@ class AgentEvent:
     tool: str = ""
     args: dict[str, Any] = field(default_factory=dict)
     ok: bool = True
+    used_tokens: int = 0
+    window_tokens: int = 0

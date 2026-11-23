@@ -5,8 +5,8 @@
 
 from __future__ import annotations
 
-from PyQt6.QtGui import QTextCursor
-from PyQt6.QtWidgets import QTextBrowser, QWidget
+from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor
+from PyQt6.QtWidgets import QTextBrowser, QTextEdit, QWidget
 
 _TONES = {
     "muted": "#5f6368",
@@ -37,6 +37,9 @@ class ChatView(QTextBrowser):
         self.setReadOnly(True)
         self.setOpenExternalLinks(True)
         self.document().setDocumentMargin(12)
+        # 每条消息在文档里的字符区间：标记名 → (起始位置, 结束位置)
+        self._marks: dict[str, tuple[int, int]] = {}
+        self._seq = 0
         self._apply_stylesheet()
 
     def _apply_stylesheet(self) -> None:
@@ -53,19 +56,29 @@ class ChatView(QTextBrowser):
         )
 
     # ---- 消息 ----
-    def append_message(self, role: str, content: str) -> None:
-        """追加一条用户或助手消息，内容按纯文本转义后显示。"""
+    def append_message(self, role: str, content: str) -> str:
+        """追加一条用户或助手消息，返回可用于定位的标记名。"""
         escaped = _escape(content).replace("\n", "<br>")
         is_user = role == "user"
         color = "#1a73e8" if is_user else "#2e7d32"
         label = "你" if is_user else "助手"
+        # append 会另起一个块；先记下插入点，事后据此定位新消息的首块
+        start = self.document().characterCount() - 1
         self.append(
             f'<div style="margin:8px 0;">'
             f'<span style="color:{color};font-weight:600;">{label}:</span> '
             f'<span style="color:#202124;">{escaped}</span>'
             f"</div>"
         )
+        block = self.document().findBlock(start)
+        if block.next().isValid():
+            block = block.next()
+        name = f"msg-{self._seq}"
+        self._seq += 1
+        self._marks[name] = (block.position(), self.document().characterCount() - 1)
+        self.setExtraSelections([])
         self._scroll_to_bottom()
+        return name
 
     def append_system(self, text: str) -> None:
         """追加一条系统提示（错误、状态信息）。"""
@@ -96,8 +109,37 @@ class ChatView(QTextBrowser):
         self.append('<hr style="border:0;border-top:1px solid #eceff1;margin:12px 0;">')
         self._scroll_to_bottom()
 
+    # ---- 定位 ----
+    def scroll_to_mark(self, name: str) -> bool:
+        """把标记对应的消息滚到视口上方并高亮；标记不存在时返回 False。"""
+        span = self._marks.get(name)
+        if span is None:
+            return False
+        start, end = span
+        block = self.document().findBlock(start)
+        # 用文档坐标算目标位置：cursorRect 对视野外的位置会被夹到视口内，不可靠
+        top = self.document().documentLayout().blockBoundingRect(block).top()
+        bar = self.verticalScrollBar()
+        # 落在视口上方 1/4 处，比贴顶更容易看清上下文
+        bar.setValue(int(top) - self.viewport().height() // 4)
+        self._highlight(start, end)
+        return True
+
+    def _highlight(self, start: int, end: int) -> None:
+        selection = QTextEdit.ExtraSelection()
+        cursor = QTextCursor(self.document())
+        cursor.setPosition(start)
+        cursor.setPosition(max(start + 1, end), QTextCursor.MoveMode.KeepAnchor)
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor("#fff3cd"))
+        selection.cursor = cursor
+        selection.format = fmt
+        self.setExtraSelections([selection])
+
     def clear_history(self) -> None:
         self.clear()
+        self._marks.clear()
+        self._seq = 0
 
     def _scroll_to_bottom(self) -> None:
         cursor = self.textCursor()

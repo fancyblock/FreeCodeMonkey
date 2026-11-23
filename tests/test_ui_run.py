@@ -112,6 +112,11 @@ class EndToEndTest(unittest.TestCase):
         self.assertIn("edit_file", transcript)
         self.assertIn("已把输出改成 hi", transcript)
         self.assertTrue(window._history)
+        # 提交的任务应登记到左侧提示词列表
+        self.assertEqual(window._prompt_list.count(), 1)
+        self.assertIsNotNone(window._prompt_list.item_mark(0))
+        # 上下文进度条应随运行时事件更新
+        self.assertGreater(window._prompt_input._context_bar.value(), 0)
         window.close()
 
     def test_denied_edit_leaves_file_intact(self) -> None:

@@ -6,6 +6,7 @@ import json
 import uuid
 from dataclasses import dataclass, field
 
+from app.constants import DEFAULT_CONTEXT_WINDOW
 from app.core.provider_types import get_spec
 
 
@@ -29,6 +30,27 @@ class ProviderConfig:
     @property
     def name(self) -> str:
         return self.values.get("name", "").strip() or "(未命名)"
+
+    @property
+    def context_window(self) -> int:
+        """模型上下文窗口（tokens）：用户填了就用，否则回落到类型默认值。"""
+        raw = self.values.get("context_window", "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                value = 0
+            if value > 0:
+                return value
+        default = next(
+            (f.default for f in get_spec(self.type).fields if f.name == "context_window"),
+            "",
+        )
+        try:
+            value = int(default)
+        except ValueError:
+            return DEFAULT_CONTEXT_WINDOW
+        return value if value > 0 else DEFAULT_CONTEXT_WINDOW
 
     def validate(self) -> None:
         """校验必填字段。API Key 仅对需要密钥的类型校验。"""

@@ -2,5 +2,6 @@
 
 from .chat_view import ChatView
 from .prompt_input import PromptInput
+from .prompt_list import PromptList
 
-__all__ = ["ChatView", "PromptInput"]
+__all__ = ["ChatView", "PromptInput", "PromptList"]

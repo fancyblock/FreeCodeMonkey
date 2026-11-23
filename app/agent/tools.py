@@ -101,17 +101,28 @@ def _human_size(size: int) -> str:
 
 
 class Workspace:
-    """工作区：绑定一个根目录，并对外提供工具集合。"""
+    """工作区：绑定一个根目录，并对外提供工具集合。
 
-    def __init__(self, root: Path | str) -> None:
+    read_only=True 时只暴露不需要审批的读类工具，供 Plan 模式使用。
+    """
+
+    def __init__(self, root: Path | str, read_only: bool = False) -> None:
         self._root = Path(root).expanduser().resolve()
         if not self._root.is_dir():
             raise ValueError(f"工作目录不存在：{self._root}")
-        self._tools: list[Tool] = self._build_tools()
+        self._read_only = read_only
+        tools = self._build_tools()
+        if read_only:
+            tools = [tool for tool in tools if not tool.requires_approval]
+        self._tools: list[Tool] = tools
 
     @property
     def root(self) -> Path:
         return self._root
+
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
 
     def tools(self) -> list[Tool]:
         return list(self._tools)
