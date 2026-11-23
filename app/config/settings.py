@@ -36,6 +36,16 @@ class Settings:
     def active_provider_id(self, value: str) -> None:
         self._q.setValue("llm/active_provider_id", value)
 
+    # ---- Agent 工作区 ----
+    @property
+    def workspace_root(self) -> str:
+        """agent 可操作的项目根目录。"""
+        return self._q.value("agent/workspace_root", "", str)
+
+    @workspace_root.setter
+    def workspace_root(self, value: str) -> None:
+        self._q.setValue("agent/workspace_root", value)
+
     # ---- 窗口状态 ----
     @property
     def geometry(self) -> QByteArray | None:

@@ -2,7 +2,11 @@
 
 采用 QObject.moveToThread 模式：每次调用创建一个 QThread，
 任务函数在该线程执行，结果通过信号回传界面线程。
-线程与 Worker 均由 Qt 父子机制自动清理，无需手动管理生命周期。
+
+句柄生命周期是这里唯一的坑：WorkerHandle 一旦被回收，PyQt 会连同它持有的
+QThread 一起销毁；若此时线程还在跑，Qt 会直接 abort 掉整个进程（表现为
+窗口毫无征兆地消失，且没有 Python 异常）。因此所有句柄都额外登记在模块级
+集合里，只有在「线程确实结束」之后才允许释放。
 """
 
 from __future__ import annotations
@@ -33,20 +37,26 @@ class FunctionWorker(QObject):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
-@dataclass
+@dataclass(eq=False)
 class WorkerHandle:
-    """一次后台任务的句柄。调用方需保持引用直至任务结束。"""
+    """一次后台任务的句柄。eq=False 保证按身份比较且可哈希。"""
 
     thread: QThread
     worker: FunctionWorker
 
 
+# 兜底注册表：只要还在跑，就保证有强引用
+_ACTIVE_HANDLES: set[WorkerHandle] = set()
+
+
 def run_in_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> WorkerHandle:
     """启动后台任务并返回句柄。
 
-    任务完成（成功或失败）后线程自动退出并释放资源。
-    调用方连接 handle.worker.result / failed 获取结果。
+    调用方连接 handle.worker.result / failed 获取结果，并在
+    handle.thread.finished 之后调用 release_handle 释放句柄。
     """
+    _sweep_finished()
+
     thread = QThread()
     worker = FunctionWorker(fn, *args, **kwargs)
     worker.moveToThread(thread)
@@ -55,7 +65,24 @@ def run_in_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> WorkerHa
     worker.result.connect(thread.quit)
     worker.failed.connect(thread.quit)
     thread.finished.connect(worker.deleteLater)
-    thread.finished.connect(thread.deleteLater)
 
+    handle = WorkerHandle(thread, worker)
+    _ACTIVE_HANDLES.add(handle)
     thread.start()
-    return WorkerHandle(thread, worker)
+    return handle
+
+
+def release_handle(handle: WorkerHandle) -> None:
+    """释放句柄。必须在线程结束（thread.finished）之后调用。"""
+    _ACTIVE_HANDLES.discard(handle)
+
+
+def _sweep_finished() -> None:
+    """清理上一批已结束的句柄，防止长时间运行累积。"""
+    for handle in list(_ACTIVE_HANDLES):
+        try:
+            if handle.thread.isFinished():
+                _ACTIVE_HANDLES.discard(handle)
+        except RuntimeError:
+            # C++ 对象已被销毁，直接从注册表移除
+            _ACTIVE_HANDLES.discard(handle)

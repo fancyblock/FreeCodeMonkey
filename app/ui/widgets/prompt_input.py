@@ -1,10 +1,10 @@
-"""输入区：多行文本输入 + 发送按钮。"""
+"""输入区：多行文本输入 + 发送 / 停止按钮。"""
 
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QKeyEvent
-from PyQt6.QtWidgets import QPlainTextEdit, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget
 
 
 class _PromptEdit(QPlainTextEdit):
@@ -23,29 +23,39 @@ class PromptInput(QWidget):
     """提示词输入组件。"""
 
     submitted = pyqtSignal(str)
+    stop_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._edit = _PromptEdit()
         self._send_button = QPushButton("发送 (Ctrl+Enter)")
+        self._stop_button = QPushButton("停止")
+        self._stop_button.setVisible(False)
         self._build_ui()
         self._connect_signals()
 
     def _build_ui(self) -> None:
-        self._edit.setPlaceholderText("输入你的编程任务或问题…")
+        self._edit.setPlaceholderText("描述你想让 agent 完成的编程任务…")
         self._edit.setMinimumHeight(80)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(self._stop_button)
+        buttons.addWidget(self._send_button)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._edit)
-        layout.addWidget(self._send_button, alignment=Qt.AlignmentFlag.AlignRight)
+        layout.addLayout(buttons)
 
     def _connect_signals(self) -> None:
         self._send_button.clicked.connect(self._emit_text)
+        self._stop_button.clicked.connect(self.stop_requested.emit)
         self._edit.submit_shortcut.connect(self._emit_text)
 
     def _emit_text(self) -> None:
         text = self.to_plain_text()
-        if text.strip():
+        if text:
             self.submitted.emit(text)
 
     def to_plain_text(self) -> str:
@@ -54,7 +64,10 @@ class PromptInput(QWidget):
     def clear(self) -> None:
         self._edit.clear()
 
-    def set_busy(self, busy: bool) -> None:
-        """忙碌时禁用输入，避免重复提交。"""
-        self._edit.setDisabled(busy)
-        self._send_button.setDisabled(busy)
+    def set_running(self, running: bool) -> None:
+        """任务进行中：禁用输入与发送，显示停止按钮。"""
+        self._edit.setDisabled(running)
+        self._send_button.setDisabled(running)
+        self._stop_button.setVisible(running)
+        if not running:
+            self._edit.setFocus()

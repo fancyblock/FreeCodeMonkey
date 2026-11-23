@@ -1,27 +1,40 @@
-"""主窗口：串联配置、Provider 管理与 LangChain 调用。"""
+"""主窗口：装配工作区、Provider 与 agent 循环。
+
+窗口本身不含任何 agent 逻辑：它只负责把界面操作翻译成 runtime 调用，
+再把 runtime 事件渲染成界面元素。
+"""
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from langchain_core.messages import BaseMessage
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPushButton,
+    QSizePolicy,
     QSplitter,
-    QWidget,
     QVBoxLayout,
+    QWidget,
 )
 
+from app.agent import AgentEvent, AgentRuntime, Workspace
+from app.agent import events as E
+from app.agent.runtime import summarize_call, trim_history
 from app.config import Settings
 from app.constants import APP_NAME, APP_VERSION
 from app.core import ProviderManager, get_spec
+from app.ui.agent_bridge import AgentBridge
 from app.ui.dialogs import SettingsDialog
 from app.ui.widgets import ChatView, PromptInput
-from app.workers import run_in_thread
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from app.workers import release_handle, run_in_thread
 
 
 class MainWindow(QMainWindow):
@@ -33,29 +46,43 @@ class MainWindow(QMainWindow):
         self._manager = manager
         # 保持任务句柄的引用，防止被垃圾回收导致线程提前销毁
         self._active_handles: list = []
-        # 会话内的多轮对话历史（不持久化）
+        # 会话内的多轮消息（不持久化）
         self._history: list[BaseMessage] = []
+        self._runtime: AgentRuntime | None = None
+        self._bridge: AgentBridge | None = None
+        self._workspace_root = self._initial_workspace()
 
         self._chat_view = ChatView()
         self._prompt_input = PromptInput()
         self._provider_combo = QComboBox()
+        self._workspace_label = QLabel()
 
         self._build_ui()
         self._create_actions()
         self._create_menus()
         self._connect_signals()
         self._refresh_providers()
+        self._refresh_workspace_label()
         self._restore_state()
 
     # ---- 构建 ----
     def _build_ui(self) -> None:
         self.setWindowTitle(f"{APP_NAME}  v{APP_VERSION}")
-        self.resize(980, 680)
+        self.resize(1020, 720)
 
-        # 顶部 Provider 选择栏
         provider_bar = QHBoxLayout()
         provider_bar.addWidget(QLabel("使用模型："))
         provider_bar.addWidget(self._provider_combo, 1)
+
+        choose_button = QPushButton("选择目录…")
+        choose_button.clicked.connect(self._choose_workspace)
+        self._workspace_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        workspace_bar = QHBoxLayout()
+        workspace_bar.addWidget(QLabel("工作区："))
+        workspace_bar.addWidget(self._workspace_label, 1)
+        workspace_bar.addWidget(choose_button)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(self._chat_view)
@@ -67,12 +94,16 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addLayout(provider_bar)
+        layout.addLayout(workspace_bar)
         layout.addWidget(splitter)
         self.setCentralWidget(container)
 
         self.statusBar().showMessage("就绪")
 
     def _create_actions(self) -> None:
+        self._workspace_action = QAction("选择工作目录…", self)
+        self._workspace_action.triggered.connect(self._choose_workspace)
+
         self._settings_action = QAction("设置…", self)
         self._settings_action.triggered.connect(self._open_settings)
 
@@ -87,6 +118,8 @@ class MainWindow(QMainWindow):
 
     def _create_menus(self) -> None:
         file_menu = self.menuBar().addMenu("文件")
+        file_menu.addAction(self._workspace_action)
+        file_menu.addSeparator()
         file_menu.addAction(self._quit_action)
 
         edit_menu = self.menuBar().addMenu("编辑")
@@ -98,9 +131,10 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self._prompt_input.submitted.connect(self._on_submit)
+        self._prompt_input.stop_requested.connect(self._on_stop)
         self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
 
-    # ---- Provider 选择 ----
+    # ---- Provider ----
     def _refresh_providers(self) -> None:
         """重新填充下拉框并恢复选中项。"""
         self._provider_combo.blockSignals(True)
@@ -116,7 +150,6 @@ class MainWindow(QMainWindow):
             if index >= 0:
                 self._provider_combo.setCurrentIndex(index)
         elif configs:
-            # 无有效选中项时回落到第一个，并写回管理器
             self._provider_combo.setCurrentIndex(0)
             first_id = self._provider_combo.itemData(0)
             if first_id is not None:
@@ -136,6 +169,35 @@ class MainWindow(QMainWindow):
         if provider_id:
             self._manager.active_id = str(provider_id)
 
+    # ---- 工作区 ----
+    def _initial_workspace(self) -> Path:
+        configured = self._settings.workspace_root.strip()
+        if configured:
+            candidate = Path(configured).expanduser()
+            if candidate.is_dir():
+                return candidate.resolve()
+        return Path.cwd().resolve()
+
+    def _refresh_workspace_label(self) -> None:
+        path = str(self._workspace_root)
+        self._workspace_label.setText(path)
+        self._workspace_label.setToolTip(path)
+
+    def _choose_workspace(self) -> None:
+        if self._active_handles:
+            self._chat_view.append_system("任务执行中，等它结束再切换工作区。")
+            return
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择 agent 的工作目录", str(self._workspace_root)
+        )
+        if not directory:
+            return
+        self._workspace_root = Path(directory).resolve()
+        self._settings.workspace_root = str(self._workspace_root)
+        self._settings.sync()
+        self._refresh_workspace_label()
+        self._chat_view.append_system(f"工作区已切换到 {self._workspace_root}")
+
     # ---- 状态持久化 ----
     def _restore_state(self) -> None:
         geometry = self._settings.geometry
@@ -143,74 +205,155 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geometry)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._active_handles:
+            # 先让工作线程有路可走：撤掉挂起的审批、请求停止
+            if self._bridge is not None:
+                self._bridge.abort_pending()
+            if self._runtime is not None:
+                self._runtime.cancel()
+
+            stuck = []
+            for handle in list(self._active_handles):
+                handle.thread.quit()
+                if not handle.thread.wait(3000):
+                    stuck.append(handle)
+            if stuck:
+                # 线程还活着就销毁窗口，等于让进程直接 abort
+                self._chat_view.append_system("任务仍在执行，请点「停止」后再关闭窗口。")
+                event.ignore()
+                return
+            for handle in list(self._active_handles):
+                self._release_handle(handle)
+
         self._settings.geometry = self.saveGeometry()
         self._settings.sync()
         super().closeEvent(event)
 
-    # ---- 槽函数 ----
+    # ---- 提交任务 ----
     @pyqtSlot(str)
     def _on_submit(self, text: str) -> None:
-        """提交任务：显示用户消息，构造模型，后台异步生成。"""
+        task = text.strip()
+        if not task:
+            return
+
         config = self._manager.active_config
         if config is None:
             self._chat_view.append_system("请先添加并选择一个 LLM Provider。")
             return
 
-        self._chat_view.append_message("user", text)
-        self._prompt_input.clear()
-        self._prompt_input.set_busy(True)
-        self.statusBar().showMessage(f"正在调用 {config.name} …")
+        try:
+            workspace = Workspace(self._workspace_root)
+        except ValueError as exc:
+            self._chat_view.append_system(f"工作区不可用：{exc}")
+            return
 
         try:
             model = self._manager.build_model(config)
         except ValueError as exc:
             self._chat_view.append_system(f"配置错误：{exc}")
-            self._prompt_input.set_busy(False)
-            self.statusBar().showMessage("配置错误")
             return
 
-        # 构造本轮消息：历史 + 当前输入
-        messages = self._history + [HumanMessage(content=text)]
-        handle = run_in_thread(model.invoke, messages)
+        if self._active_handles:
+            self._chat_view.append_system("上一个任务还在执行，请先停止或等待完成。")
+            return
+
+        self._chat_view.append_message("user", task)
+        self._prompt_input.clear()
+        self._prompt_input.set_running(True)
+        self.statusBar().showMessage(f"正在调用 {config.name} …")
+
+        bridge = AgentBridge(self)
+        bridge.agent_event.connect(self._on_agent_event)
+        runtime = AgentRuntime(model, workspace, bridge)
+        self._bridge = bridge
+        self._runtime = runtime
+
+        handle = run_in_thread(runtime.run, task, list(self._history), bridge.agent_event.emit)
         self._active_handles.append(handle)
-        handle.worker.result.connect(
-            lambda reply: self._on_result(reply, handle, messages)
-        )
-        handle.worker.failed.connect(lambda msg: self._on_error(msg, handle))
+        handle.worker.result.connect(lambda messages: self._on_run_done(messages, handle))
+        handle.worker.failed.connect(lambda msg: self._on_run_failed(msg, handle))
+        # 线程生命周期归界面管：只有 finished 之后才允许释放句柄，
+        # 提前释放会让 PyQt 销毁运行中的 QThread，进程直接崩掉。
+        handle.thread.finished.connect(self._on_thread_finished)
 
-    def _on_result(self, reply: AIMessage, handle, messages: list[BaseMessage]) -> None:
-        content = reply.content
-        if isinstance(content, list):
-            text_parts = [
-                str(block.get("text", "")) if isinstance(block, dict) else str(block)
-                for block in content
-            ]
-            content = "".join(text_parts)
-        content = str(content)
+    @pyqtSlot(object)
+    def _on_agent_event(self, event: AgentEvent) -> None:
+        """把 runtime 事件渲染成步骤流。"""
+        kind = event.kind
+        if kind == E.STEP:
+            self._chat_view.append_step(f"— 第 {event.step} 步 —")
+            self.statusBar().showMessage(f"第 {event.step} 步：推理中")
+        elif kind == E.THOUGHT:
+            self._chat_view.append_step("", event.text, "muted")
+        elif kind == E.TOOL_CALL:
+            summary = summarize_call(event.tool, event.args)
+            self._chat_view.append_step(f"▸ {event.tool}  {summary}", tone="info")
+            self.statusBar().showMessage(f"执行 {event.tool} …")
+        elif kind == E.TOOL_RESULT:
+            mark = "→" if event.ok else "✗"
+            tone = "ok" if event.ok else "bad"
+            self._chat_view.append_step(f"{mark} {event.tool}", event.text, tone)
+            self.statusBar().showMessage(f"{event.tool} 完成")
+        elif kind == E.DENIED:
+            self._chat_view.append_step(f"✗ 已拒绝 {event.tool}", event.text, "bad")
+            self.statusBar().showMessage("你拒绝了一个操作")
+        elif kind == E.DONE:
+            self._chat_view.append_message("assistant", event.text)
+            self.statusBar().showMessage("就绪")
+        elif kind == E.ERROR:
+            self._chat_view.append_system(event.text)
+            self.statusBar().showMessage("出错")
 
-        # 仅成功时把本轮消息写入历史
-        self._history = messages + [AIMessage(content=content)]
-        self._chat_view.append_message("assistant", content)
-        self._finish_task(handle, "就绪")
+    def _on_run_done(self, messages: list[BaseMessage], handle) -> None:
+        self._history = trim_history(list(messages))
+        self._finish_task("就绪")
 
-    def _on_error(self, message: str, handle) -> None:
+    def _on_run_failed(self, message: str, handle) -> None:
         self._chat_view.append_system(f"错误：{message}")
-        self._finish_task(handle, "出错")
+        self._finish_task("出错")
 
-    def _finish_task(self, handle, status: str) -> None:
-        self._prompt_input.set_busy(False)
+    def _on_stop(self) -> None:
+        if self._runtime is None:
+            return
+        self._runtime.cancel()
+        self.statusBar().showMessage("已请求停止，当前步骤结束后生效…")
+
+    def _finish_task(self, status: str) -> None:
+        """只复位界面状态；句柄要等线程真正结束再由 _on_thread_finished 释放。"""
+        self._prompt_input.set_running(False)
         self.statusBar().showMessage(status)
+
+    @pyqtSlot()
+    def _on_thread_finished(self) -> None:
+        thread = self.sender()
+        for handle in list(self._active_handles):
+            try:
+                matched = handle.thread is thread
+            except RuntimeError:
+                matched = False
+            if matched:
+                self._release_handle(handle)
+                break
+
+    def _release_handle(self, handle) -> None:
         if handle in self._active_handles:
             self._active_handles.remove(handle)
+        release_handle(handle)
+        if not self._active_handles:
+            self._runtime = None
+            self._bridge = None
 
+    # ---- 菜单动作 ----
     def _clear_history(self) -> None:
+        if self._active_handles:
+            self._chat_view.append_system("任务执行中，无法清空对话。")
+            return
         self._history.clear()
         self._chat_view.clear_history()
 
     def _open_settings(self) -> None:
         dialog = SettingsDialog(self._manager, self)
         dialog.exec()
-        # 设置可能在对话框中被增删，刷新下拉框
         self._refresh_providers()
 
     def _show_about(self) -> None:
@@ -218,6 +361,7 @@ class MainWindow(QMainWindow):
             self,
             "关于",
             f"<b>{APP_NAME}</b> v{APP_VERSION}<br><br>"
-            "简单的编程智能体，基于 LangChain，支持多种 LLM。<br>"
-            "在「编辑 → 设置」中添加并管理模型连接。",
+            "一个在本机工作的编程智能体：能读文件、搜代码、改代码、跑命令。<br>"
+            "写文件与执行命令需要你逐次确认。<br><br>"
+            "在「编辑 → 设置」中配置模型，在顶部选择工作区目录。",
         )
