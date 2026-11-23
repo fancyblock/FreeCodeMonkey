@@ -115,7 +115,19 @@ class AgentLoopTest(unittest.TestCase):
         model, _ = self.run_agent([AIMessage(content="ok")])
         self.assertEqual(len(model.received_tools), 1)
         names = [schema["function"]["name"] for schema in model.received_tools[0]]
-        self.assertEqual(names, ["read_file", "list_dir", "grep", "edit_file", "run_command"])
+        self.assertEqual(
+            names,
+            [
+                "read_file",
+                "list_dir",
+                "grep",
+                "edit_file",
+                "run_command",
+                "outline",
+                "read_symbol",
+                "syntax_check",
+            ],
+        )
 
     # ---- Plan / Build 模式 ----
     def test_plan_mode_only_exposes_read_tools(self) -> None:
@@ -125,7 +137,10 @@ class AgentLoopTest(unittest.TestCase):
         runtime.run("先看看代码再给计划", [], self.events.append)
 
         names = [schema["function"]["name"] for schema in model.received_tools[0]]
-        self.assertEqual(names, ["read_file", "list_dir", "grep"])
+        self.assertEqual(
+            names,
+            ["read_file", "list_dir", "grep", "outline", "read_symbol", "syntax_check"],
+        )
         # 用的是 Plan 提示词，而不是 Build 的
         system = model.received_messages[0][0]
         self.assertIn("Plan 模式", system.content)

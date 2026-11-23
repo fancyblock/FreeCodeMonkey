@@ -4,3 +4,5 @@ langgraph>=1.2,<2
 langchain-openai>=1.8,<2
 langchain-anthropic>=1.7,<2
 langchain-ollama>=1.1,<2
+tree-sitter>=0.25,<0.27
+tree-sitter-python>=0.25,<0.26

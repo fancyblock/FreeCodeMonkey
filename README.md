@@ -39,7 +39,8 @@ app/
 ├── agent/                       ★ 编程智能体（不依赖 Qt，可无界面运行）
 │   ├── events.py                事件定义（步骤/工具/结果/结束）
 │   ├── approval.py              审批协议 + 测试用放行/拒绝通道
-│   ├── tools.py                 5 个工具与工作区路径约束
+│   ├── tools.py                 8 个工具与工作区路径约束
+│   ├── syntax.py                tree-sitter 解析：outline/read_symbol/syntax_check
 │   ├── prompts.py               系统提示词（行为纪律）
 │   └── runtime.py               ReAct 循环
 ├── workers/task_worker.py       通用异步任务封装（QThread）
@@ -62,8 +63,14 @@ app/
 | `grep` | 正则搜索文件内容，支持 `glob` 过滤与上下文行 | 否 |
 | `edit_file` | 精确字符串替换，`old_string` 必须唯一 | **是** |
 | `run_command` | 在工作区根目录执行 shell 命令（Windows 为 cmd） | **是** |
+| `outline` | 用语法树列出类 / 函数骨架与行号，可按名称过滤，适合先看结构 | 否 |
+| `read_symbol` | 按符号名（支持 `Class.method`）读取整段源码，带行号 | 否 |
+| `syntax_check` | 语法检查，报告 `ERROR` / `MISSING` 节点的行号与源码片段 | 否 |
 
 `edit_file` 兼做新建：文件不存在且 `old_string` 传空串时，按 `new_string` 创建文件。
+
+后三个工具基于 tree-sitter，**只解析 Python**，属于语法级信息：没有类型推导，
+也没有跨文件引用索引。结果是结构化行号，不会把整份文件塞进上下文。
 
 #### 安全边界
 
@@ -114,6 +121,7 @@ python -m venv .venv
 
 ```bash
 .venv\Scripts\python.exe tests\test_agent_loop.py    # 循环与工具，用假模型，不需要 API Key
+.venv\Scripts\python.exe tests\test_codeintel.py     # 语法工具：结构、符号、语法检查
 .venv\Scripts\python.exe tests\test_ui_smoke.py      # 界面装配，offscreen，不需要显示器
 .venv\Scripts\python.exe tests\test_ui_run.py        # 端到端：线程 → 审批 → 回灌 → 渲染
 ```
@@ -126,6 +134,8 @@ python -m venv .venv
 - 没有 token 级流式输出：中间步骤实时可见，但最终回答是一次性出现的。
 - 对话历史只存在内存里，关闭即失；超过 40 条会自动截断。
 - 没有沙箱与网络白名单，安全全靠审批。
+- 只有语法级理解：没有 LSP，不支持跳转定义、跨文件引用分析或类型推导；
+  tree-sitter 目前只接了 Python（加语言只需在 `syntax.py` 的 `GRAMMARS` 里登记）。
 - `langgraph` 已在依赖中但未使用，保留给将来需要多 agent 或断点续跑时替换 `runtime.py`。
 
 #### 两个踩过的坑（改代码前先读）

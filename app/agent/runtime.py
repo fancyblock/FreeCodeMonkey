@@ -202,6 +202,13 @@ def summarize_call(tool_name: str, args: dict[str, Any]) -> str:
         old_lines = len(str(old).splitlines())
         new_lines = len(str(new).splitlines())
         return f"{path} · {old_lines} 行 → {new_lines} 行"
+    if tool_name == "outline":
+        path = str(args.get("path") or ".")
+        return f"{path} · depth={args.get('depth') or 1}"
+    if tool_name == "read_symbol":
+        return f"{args.get('path', '')} · {args.get('name', '')}"
+    if tool_name == "syntax_check":
+        return str(args.get("path") or ".")
     return clip_text(json.dumps(args, ensure_ascii=False), 90)
 
 

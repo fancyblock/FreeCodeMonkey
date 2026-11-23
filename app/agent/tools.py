@@ -149,6 +149,17 @@ class Workspace:
             return f"工具执行异常：{type(exc).__name__}: {exc}"
 
     # ---- 路径工具 ----
+    # 公共包装：语法工具（syntax.py）需要复用同一套路径沙箱与遍历规则，
+    # 直接暴露三个薄方法，避免把安全逻辑复制成第二份。
+    def rel(self, path: Path) -> str:
+        return self._rel(path)
+
+    def resolve(self, raw: str | None, *, allow_missing: bool = False) -> Path:
+        return self._resolve(raw, allow_missing=allow_missing)
+
+    def iter_files(self, base: Path) -> Iterator[Path]:
+        return self._iter_files(base)
+
     def _rel(self, path: Path) -> str:
         if path == self._root:
             return "."
@@ -418,6 +429,9 @@ class Workspace:
 
     # ---- 注册 ----
     def _build_tools(self) -> list[Tool]:
+        # 局部 import：syntax.py 反过来需要 Tool / Workspace，模块级导入会形成循环。
+        from .syntax import build_syntax_tools
+
         return [
             Tool(
                 name="read_file",
@@ -531,4 +545,4 @@ class Workspace:
                 requires_approval=True,
                 danger=DANGER_EXEC,
             ),
-        ]
+        ] + build_syntax_tools(self)
