@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtGui import QFont, QFontMetrics
+from PyQt6.QtGui import QFontMetrics
 from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.agent.tools import MAX_FILE_BYTES, ToolError, Workspace
+from app.ui.theme import mono_font
 
 MAX_PREVIEW_LINES = 2000
 
@@ -36,15 +37,15 @@ class FilePreviewDialog(QDialog):
         self.resize(760, 640)
 
         self._caption = QLabel()
-        self._caption.setStyleSheet("color:#5f6368;font-size:11px;")
+        self._caption.setProperty("role", "caption")
         self._caption.setWordWrap(True)
 
         self._body = QPlainTextEdit()
         self._body.setReadOnly(True)
         self._body.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._body.setProperty("role", "code")
         # 行号靠 tab 对齐；默认制表位太宽，收窄到四个字符
-        mono = QFont("Consolas", 10)
-        mono.setStyleHint(QFont.StyleHint.Monospace)
+        mono = mono_font(10)
         self._body.setFont(mono)
         self._body.setTabStopDistance(QFontMetrics(mono).horizontalAdvance(" ") * 4)
 

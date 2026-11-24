@@ -16,14 +16,14 @@ from PyQt6.QtWidgets import (
 )
 
 from app.constants import DEFAULT_CONTEXT_WINDOW
+from app.ui.icons import icon
+from app.ui.theme import context_level, palette, repolish
 
 _MODE_OPTIONS = (
     ("plan", "Plan", "只读：分析代码并给出修改计划，不改文件也不执行命令"),
     ("build", "Build", "可写：直接修改代码并执行命令，危险操作会弹窗确认"),
 )
 _DEFAULT_MODE = "build"
-_CONTEXT_WARN = 60
-_CONTEXT_DANGER = 85
 
 
 class _PromptEdit(QPlainTextEdit):
@@ -53,7 +53,10 @@ class PromptInput(QWidget):
         self._used_tokens = 0
         self._window_tokens = DEFAULT_CONTEXT_WINDOW
         self._send_button = QPushButton("发送 (Ctrl+Enter)")
+        self._send_button.setObjectName("primary")
+        self._send_button.setIcon(icon("send", palette().on_accent, 14))
         self._stop_button = QPushButton("停止")
+        self._stop_button.setIcon(icon("stop", size=14))
         self._stop_button.setVisible(False)
         self._build_ui()
         self._connect_signals()
@@ -130,17 +133,11 @@ class PromptInput(QWidget):
             f"上下文占用：约 {self._used_tokens:,} / {self._window_tokens:,} tokens"
             f"（{percent}%）"
         )
-        if percent >= _CONTEXT_DANGER:
-            color = "#c5221f"
-        elif percent >= _CONTEXT_WARN:
-            color = "#e37400"
-        else:
-            color = "#1e8e3e"
-        self._context_bar.setStyleSheet(
-            "QProgressBar { border:1px solid #dadce0; border-radius:4px;"
-            "background:#f1f3f4; font-size:11px; text-align:center; color:#3c4043; }"
-            f"QProgressBar::chunk {{ background:{color}; border-radius:3px; }}"
-        )
+        # 只切语义档位，颜色由全局 QSS 的 [level=...] 规则决定
+        level = context_level(percent)
+        if self._context_bar.property("level") != level:
+            self._context_bar.setProperty("level", level)
+            repolish(self._context_bar)
 
     def set_context_window(self, window_tokens: int) -> None:
         """模型换窗口时（例如切 provider）按新窗口重算比例。"""

@@ -18,7 +18,6 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
-    QPushButton,
     QSizePolicy,
     QSplitter,
     QVBoxLayout,
@@ -29,15 +28,24 @@ from app.agent import AgentEvent, AgentRuntime, Workspace
 from app.agent import events as E
 from app.agent.runtime import summarize_call, trim_history
 from app.config import Settings
-from app.constants import APP_NAME, APP_VERSION, DEFAULT_CONTEXT_WINDOW
+from app.constants import (
+    APP_NAME,
+    APP_VERSION,
+    DEFAULT_CONTEXT_WINDOW,
+    MAX_WORKSPACE_HISTORY,
+)
 from app.core import ProviderManager, get_spec
 from app.ui.agent_bridge import AgentBridge
 from app.ui.dialogs import FilePreviewDialog, SettingsDialog
+from app.ui.icons import icon
 from app.ui.widgets import ChatView, FileTree, PromptInput, PromptList
 from app.workers import release_handle, run_in_thread
 
 # 会改动工作区文件系统的工具；新增写类工具时要在这里登记
 _MUTATING_TOOLS = frozenset({"edit_file", "run_command"})
+
+# 下拉框里固定那一项「选择目录…」的标识
+_WORKSPACE_PICK = "__pick_directory__"
 
 
 class MainWindow(QMainWindow):
@@ -54,6 +62,7 @@ class MainWindow(QMainWindow):
         self._runtime: AgentRuntime | None = None
         self._bridge: AgentBridge | None = None
         self._workspace_root = self._initial_workspace()
+        self._workspace_history = self._load_workspace_history()
         # 本次任务是否改过文件；任务结束时决定要不要刷新文件树
         self._files_changed = False
 
@@ -62,41 +71,48 @@ class MainWindow(QMainWindow):
         self._prompt_list = PromptList()
         self._file_tree = FileTree()
         self._provider_combo = QComboBox()
-        self._workspace_label = QLabel()
+        self._workspace_combo = QComboBox()
 
         self._build_ui()
         self._create_actions()
         self._create_menus()
         self._connect_signals()
         self._refresh_providers()
-        self._refresh_workspace_label()
+        self._sync_workspace_combo()
         self._file_tree.set_root(self._workspace_root)
         self._restore_state()
 
     # ---- 构建 ----
     def _build_ui(self) -> None:
         self.setWindowTitle(f"{APP_NAME}  v{APP_VERSION}")
-        self.resize(1020, 720)
+        self.resize(1120, 760)
 
-        provider_bar = QHBoxLayout()
-        provider_bar.addWidget(QLabel("使用模型："))
-        provider_bar.addWidget(self._provider_combo, 1)
-
-        choose_button = QPushButton("选择目录…")
-        choose_button.clicked.connect(self._choose_workspace)
-        self._workspace_label.setSizePolicy(
-            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        # 下拉框列出用过的目录和固定的「选择目录…」；长路径靠悬停看全
+        self._workspace_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
-        workspace_bar = QHBoxLayout()
-        workspace_bar.addWidget(QLabel("工作区："))
-        workspace_bar.addWidget(self._workspace_label, 1)
-        workspace_bar.addWidget(choose_button)
+        self._workspace_combo.setMinimumContentsLength(24)
+        self._workspace_combo.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
+        self._workspace_combo.setToolTip(str(self._workspace_root))
+        self._workspace_combo.activated.connect(self._on_workspace_activated)
+
+        # 模型与工作区合成一行，省下一条栏的垂直空间
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
+        toolbar.addWidget(QLabel("使用模型："))
+        toolbar.addWidget(self._provider_combo, 3)
+        toolbar.addSpacing(10)
+        toolbar.addWidget(QLabel("工作区："))
+        toolbar.addWidget(self._workspace_combo, 2)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(self._chat_view)
         splitter.addWidget(self._prompt_input)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 1)
+        splitter.setHandleWidth(6)
 
         # 左栏上下分：文件树在上、提示词列表在下，中间可拖动
         left = QSplitter(Qt.Orientation.Vertical)
@@ -108,6 +124,7 @@ class MainWindow(QMainWindow):
         left.setCollapsible(1, False)
         left.setMinimumWidth(180)
         left.setSizes([320, 200])
+        left.setHandleWidth(6)
 
         # 左侧整列横跨对话区与输入框；窗口变窄时优先压缩对话区
         body = QSplitter(Qt.Orientation.Horizontal)
@@ -116,15 +133,18 @@ class MainWindow(QMainWindow):
         body.setStretchFactor(0, 0)
         body.setStretchFactor(1, 1)
         body.setCollapsible(0, False)
-        body.setSizes([260, 760])
+        body.setSizes([270, 800])
+        body.setHandleWidth(6)
         self._body_splitter = body
         self._left_splitter = left
 
         container = QWidget()
+        # 全局 QSS 靠这个 objectName 给窗口底色
+        container.setObjectName("root")
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.addLayout(provider_bar)
-        layout.addLayout(workspace_bar)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(8)
+        layout.addLayout(toolbar)
         layout.addWidget(body)
         self.setCentralWidget(container)
 
@@ -132,9 +152,11 @@ class MainWindow(QMainWindow):
 
     def _create_actions(self) -> None:
         self._workspace_action = QAction("选择工作目录…", self)
+        self._workspace_action.setIcon(icon("folder", size=14))
         self._workspace_action.triggered.connect(self._choose_workspace)
 
         self._settings_action = QAction("设置…", self)
+        self._settings_action.setIcon(icon("settings", size=14))
         self._settings_action.triggered.connect(self._open_settings)
 
         self._clear_action = QAction("清空对话", self)
@@ -216,27 +238,115 @@ class MainWindow(QMainWindow):
                 return candidate.resolve()
         return Path.cwd().resolve()
 
-    def _refresh_workspace_label(self) -> None:
-        path = str(self._workspace_root)
-        self._workspace_label.setText(path)
-        self._workspace_label.setToolTip(path)
+    def _load_workspace_history(self) -> list[str]:
+        """读历史目录：去重、保持原有顺序（最近的在前）。"""
+        seen: list[str] = []
+        for path in self._settings.workspace_history:
+            if path not in seen:
+                seen.append(path)
+        return seen[:MAX_WORKSPACE_HISTORY]
+
+    def _remember_workspace(self, root: Path) -> None:
+        """把目录挪到历史最前面，并落盘。"""
+        path = str(root)
+        self._workspace_history = [
+            path,
+            *(item for item in self._workspace_history if item != path),
+        ][:MAX_WORKSPACE_HISTORY]
+        self._settings.workspace_history = self._workspace_history
+        self._settings.sync()
+
+    def _forget_workspace(self, path: str) -> None:
+        """目录已经不存在：从历史和下拉框里移除。"""
+        if path not in self._workspace_history:
+            return
+        self._workspace_history = [
+            item for item in self._workspace_history if item != path
+        ]
+        self._settings.workspace_history = self._workspace_history
+        self._settings.sync()
+
+    def _sync_workspace_combo(self) -> None:
+        """按「当前目录 → 其他历史目录 → 分隔线 → 选择目录…」重建下拉项。"""
+        combo = self._workspace_combo
+        current = str(self._workspace_root)
+        entries = [current]
+        for path in self._workspace_history:
+            if path not in entries:
+                entries.append(path)
+
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            for path in entries:
+                combo.addItem(path, path)
+            combo.insertSeparator(combo.count())
+            combo.addItem("选择目录…", _WORKSPACE_PICK)
+            index = combo.findData(current)
+            combo.setCurrentIndex(index if index >= 0 else combo.count() - 1)
+            combo.setToolTip(current)
+        finally:
+            combo.blockSignals(False)
+
+    @pyqtSlot(int)
+    def _on_workspace_activated(self, index: int) -> None:
+        """用户从下拉框里选了某一项。"""
+        data = self._workspace_combo.itemData(index)
+        if data == _WORKSPACE_PICK:
+            self._choose_workspace()
+            return
+        if not isinstance(data, str) or not data:
+            # 分隔线之类没有实际目录的项，把显示恢复到当前工作区
+            self._sync_workspace_combo()
+            return
+
+        target = Path(data)
+        if not target.is_dir():
+            self._chat_view.append_system(f"目录已不存在，已从列表移除：{data}")
+            self._forget_workspace(data)
+            self._sync_workspace_combo()
+            return
+
+        target = target.resolve()
+        if target == self._workspace_root:
+            self._sync_workspace_combo()
+            return
+        if self._active_handles:
+            self._chat_view.append_system("任务执行中，等它结束再切换工作区。")
+            self._sync_workspace_combo()
+            return
+        self._apply_workspace(target)
 
     def _choose_workspace(self) -> None:
         if self._active_handles:
             self._chat_view.append_system("任务执行中，等它结束再切换工作区。")
+            self._sync_workspace_combo()
             return
         directory = QFileDialog.getExistingDirectory(
             self, "选择 agent 的工作目录", str(self._workspace_root)
         )
         if not directory:
+            self._sync_workspace_combo()
             return
-        self._workspace_root = Path(directory).resolve()
-        self._settings.workspace_root = str(self._workspace_root)
-        self._settings.sync()
-        self._refresh_workspace_label()
-        self._file_tree.set_root(self._workspace_root)
+        path = Path(directory)
+        if not path.is_dir():
+            self._chat_view.append_system(f"目录不可用：{directory}")
+            self._sync_workspace_combo()
+            return
+        self._apply_workspace(path.resolve())
+
+    def _apply_workspace(self, root: Path) -> None:
+        """切换工作区：更新配置、文件树与下拉列表。"""
+        previous = self._workspace_root
+        self._workspace_root = root
+        self._settings.workspace_root = str(root)
+        # 先把上一个目录留在历史里，再把新目录顶到最前
+        self._remember_workspace(previous)
+        self._remember_workspace(root)
+        self._sync_workspace_combo()
+        self._file_tree.set_root(root)
         self._files_changed = False
-        self._chat_view.append_system(f"工作区已切换到 {self._workspace_root}")
+        self._chat_view.append_system(f"工作区已切换到 {root}")
 
     @pyqtSlot(str)
     def _open_preview(self, rel_path: str) -> None:

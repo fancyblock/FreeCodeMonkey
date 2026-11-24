@@ -8,12 +8,22 @@ from __future__ import annotations
 from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import QTextBrowser, QTextEdit, QWidget
 
-_TONES = {
-    "muted": "#5f6368",
-    "info": "#1a73e8",
-    "ok": "#1e8e3e",
-    "bad": "#c5221f",
+from app.ui.theme import palette
+
+# HTML 片段里只能用字体栈字符串，QFont 下发不到富文本片段
+_MONO_STACK = "Consolas,'Cascadia Mono','Courier New',monospace"
+
+# 步骤的语义色调 → 色板字段名
+_TONE_ATTRS = {
+    "muted": "text_muted",
+    "info": "accent",
+    "ok": "success",
+    "bad": "danger",
 }
+
+
+def _tone_color(tone: str) -> str:
+    return getattr(palette(), _TONE_ATTRS.get(tone, "text_muted"))
 
 
 def _escape(text: str) -> str:
@@ -36,40 +46,44 @@ class ChatView(QTextBrowser):
         super().__init__(parent)
         self.setReadOnly(True)
         self.setOpenExternalLinks(True)
-        self.document().setDocumentMargin(12)
+        self.document().setDocumentMargin(16)
+        # 空状态用 placeholder：不会写进文档，清空后 toPlainText() 仍为空
+        self.setPlaceholderText("描述你想让 agent 完成的编程任务，按 Ctrl+Enter 发送…")
         # 每条消息在文档里的字符区间：标记名 → (起始位置, 结束位置)
         self._marks: dict[str, tuple[int, int]] = {}
         self._seq = 0
-        self._apply_stylesheet()
-
-    def _apply_stylesheet(self) -> None:
-        self.setStyleSheet(
-            """
-            QTextBrowser {
-                background: #ffffff;
-                border: 1px solid #e0e0e0;
-                border-radius: 6px;
-                font-size: 13px;
-                line-height: 150%;
-            }
-            """
-        )
 
     # ---- 消息 ----
     def append_message(self, role: str, content: str) -> str:
         """追加一条用户或助手消息，返回可用于定位的标记名。"""
+        tokens = palette()
         escaped = _escape(content).replace("\n", "<br>")
         is_user = role == "user"
-        color = "#1a73e8" if is_user else "#2e7d32"
         label = "你" if is_user else "助手"
+        head = (
+            f'<span style="color:{tokens.accent if is_user else tokens.success};'
+            f'font-weight:600;">{label}</span>'
+            f'<br><span style="color:{tokens.text};">{escaped}</span>'
+        )
+        if is_user:
+            # 富文本不支持 border-radius / border-left，用两格表格做出
+            # 「浅底 + 左侧强调条」的引述块效果。强调条必须用 td 的
+            # width/bgcolor 属性，写成 CSS 会被富文本引擎按内容宽度分配。
+            body = (
+                '<table width="100%" cellspacing="0" cellpadding="0"'
+                ' style="margin:10px 0;">'
+                f'<tr><td width="4" bgcolor="{tokens.accent}"></td>'
+                f'<td bgcolor="{tokens.surface_alt}"'
+                f' style="padding:7px 11px;line-height:150%;">{head}</td>'
+                "</tr></table>"
+            )
+        else:
+            body = (
+                f'<div style="margin:10px 0;line-height:150%;">{head}</div>'
+            )
         # append 会另起一个块；先记下插入点，事后据此定位新消息的首块
         start = self.document().characterCount() - 1
-        self.append(
-            f'<div style="margin:8px 0;">'
-            f'<span style="color:{color};font-weight:600;">{label}:</span> '
-            f'<span style="color:#202124;">{escaped}</span>'
-            f"</div>"
-        )
+        self.append(body)
         block = self.document().findBlock(start)
         if block.next().isValid():
             block = block.next()
@@ -84,29 +98,36 @@ class ChatView(QTextBrowser):
         """追加一条系统提示（错误、状态信息）。"""
         escaped = _escape(text).replace("\n", "<br>")
         self.append(
-            f'<div style="margin:6px 0;color:#9aa0a6;font-style:italic;">{escaped}</div>'
+            f'<div style="margin:6px 0;color:{palette().text_faint};'
+            f'font-style:italic;">{escaped}</div>'
         )
         self._scroll_to_bottom()
 
     # ---- agent 步骤 ----
     def append_step(self, title: str, body: str = "", tone: str = "muted") -> None:
         """追加一行执行步骤。body 用等宽字体，最多展示 8 行。"""
-        color = _TONES.get(tone, _TONES["muted"])
-        html = ['<div style="margin:5px 0 5px 20px;font-size:12px;line-height:145%;">']
+        tokens = palette()
+        color = _tone_color(tone)
+        html = ['<div style="margin:6px 0 6px 20px;font-size:12px;line-height:145%;">']
         if title:
             html.append(f'<span style="color:{color};">{_escape(title)}</span>')
         if body:
             html.append(
-                '<pre style="margin:3px 0 0 10px;padding-left:8px;'
-                "border-left:2px solid #e8eaed;font-family:Consolas,'Courier New',monospace;"
-                f'font-size:11px;color:#80868b;">{_block(body)}</pre>'
+                '<pre style="margin:4px 0 0 10px;'
+                f"font-family:{_MONO_STACK};font-size:11px;"
+                f'color:{tokens.text_faint};">{_block(body)}</pre>'
             )
         html.append("</div>")
         self.append("".join(html))
         self._scroll_to_bottom()
 
     def append_divider(self) -> None:
-        self.append('<hr style="border:0;border-top:1px solid #eceff1;margin:12px 0;">')
+        # 不用 <hr>：富文本把它画成带上下边框的空 frame，会出来两条线。
+        # 1px 字号 + 1px 行高的空段落是唯一能按令牌画出细线的写法。
+        self.append(
+            f'<p style="margin:14px 0;background-color:{palette().border};'
+            'font-size:1px;line-height:1px;">&nbsp;</p>'
+        )
         self._scroll_to_bottom()
 
     # ---- 定位 ----
@@ -131,7 +152,7 @@ class ChatView(QTextBrowser):
         cursor.setPosition(start)
         cursor.setPosition(max(start + 1, end), QTextCursor.MoveMode.KeepAnchor)
         fmt = QTextCharFormat()
-        fmt.setBackground(QColor("#fff3cd"))
+        fmt.setBackground(QColor(palette().highlight))
         selection.cursor = cursor
         selection.format = fmt
         self.setExtraSelections([selection])

@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.agent.tools import SKIP_DIRS
+from app.ui.icons import icon
 
 # 单个目录最多渲染多少条；病态目录不应该让界面卡住
 MAX_TREE_ENTRIES = 500
@@ -46,12 +47,12 @@ class FileTree(QWidget):
     # ---- 构建 ----
     def _build_ui(self) -> None:
         title = QLabel("文件")
-        title.setStyleSheet("color:#5f6368;font-weight:600;padding:2px 2px 4px 2px;")
+        title.setProperty("role", "section")
 
-        self._refresh_button = QPushButton("刷新")
-        self._refresh_button.setFlat(True)
-        self._refresh_button.setFixedWidth(44)
-        self._refresh_button.setStyleSheet("color:#5f6368;font-size:11px;")
+        self._refresh_button = QPushButton()
+        self._refresh_button.setObjectName("icon")
+        self._refresh_button.setIcon(icon("refresh", size=14))
+        self._refresh_button.setFixedSize(24, 24)
         self._refresh_button.setToolTip("重新读取文件树")
 
         header = QHBoxLayout()

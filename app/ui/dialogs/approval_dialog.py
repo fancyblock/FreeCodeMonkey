@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.agent import ApprovalDecision, ApprovalRequest
+from app.ui.theme import mono_font
 
 _DANGER_HINT = {
     "write": "此操作会修改工作区中的文件。请确认修改内容符合预期。",
@@ -42,34 +43,31 @@ class ApprovalDialog(QDialog):
         hint = _DANGER_HINT.get(self._request.tool, "此操作需要你的确认。")
 
         title = QLabel("Agent 想执行一个操作")
-        title.setStyleSheet("font-size: 14px; font-weight: 600; color: #202124;")
+        title.setProperty("role", "title")
 
         tool_label = QLabel(f"{self._request.tool}  ·  {self._request.title}")
         tool_label.setWordWrap(True)
-        tool_label.setStyleSheet(
-            "font-family: Consolas, 'Courier New', monospace; font-size: 13px; color: #1a73e8;"
-        )
+        tool_label.setProperty("role", "accent")
+        tool_label.setFont(mono_font(10))
 
         hint_label = QLabel(hint)
         hint_label.setWordWrap(True)
-        hint_label.setStyleSheet("color: #c5221f; font-size: 12px;")
+        hint_label.setProperty("role", "danger")
 
         detail = QPlainTextEdit(self._request.detail)
         detail.setReadOnly(True)
         detail.setMaximumHeight(240)
-        detail.setStyleSheet(
-            "font-family: Consolas, 'Courier New', monospace; font-size: 12px;"
-            "background: #f8f9fa; border: 1px solid #e0e0e0;"
-        )
+        detail.setProperty("role", "code")
+        detail.setFont(mono_font(9))
 
         self._remember = QCheckBox(f"本会话内不再询问 {self._request.tool} 的同类操作")
-        self._remember.setStyleSheet("font-size: 12px; color: #5f6368;")
 
         reject_button = QPushButton("拒绝")
         reject_button.setDefault(True)
         reject_button.clicked.connect(self._on_reject)
 
         allow_button = QPushButton("允许执行")
+        allow_button.setObjectName("danger")
         allow_button.clicked.connect(self._on_allow)
 
         buttons = QHBoxLayout()

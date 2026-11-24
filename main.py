@@ -13,6 +13,7 @@ from app.config import Settings
 from app.constants import APP_NAME, APP_ORG, APP_VERSION
 from app.core import ProviderManager
 from app.ui import MainWindow
+from app.ui.theme import apply_theme
 
 
 def main() -> int:
@@ -22,6 +23,8 @@ def main() -> int:
     QApplication.setApplicationVersion(APP_VERSION)
 
     app = QApplication(sys.argv)
+    # 风格、字体与全局样式表都在这里一次性装好
+    apply_theme(app)
     settings = Settings()
     manager = ProviderManager(settings)
     window = MainWindow(settings, manager)

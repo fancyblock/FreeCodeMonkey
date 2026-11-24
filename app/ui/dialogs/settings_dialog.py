@@ -27,6 +27,7 @@ from app.core import (
     PROVIDER_TYPES,
     get_spec,
 )
+from app.ui.theme import set_state
 from app.workers import run_in_thread
 
 
@@ -79,7 +80,7 @@ class SettingsDialog(QDialog):
         right.addWidget(QLabel("类型"))
         right.addWidget(self._type_combo)
         right.addLayout(self._form_layout)
-        right.addWidget(self._test_button)
+        right.addWidget(self._test_button, alignment=Qt.AlignmentFlag.AlignLeft)
         right.addWidget(self._test_result)
         right.addStretch(1)
 
@@ -222,12 +223,12 @@ class SettingsDialog(QDialog):
 
     def _on_test_result(self, text: str, handle) -> None:
         self._test_result.setText(f"连接成功。模型回复：{text}")
-        self._test_result.setStyleSheet("color: #2e7d32;")
+        set_state(self._test_result, "success")
         self._finish_test(handle)
 
     def _on_test_failed(self, message: str, handle) -> None:
         self._test_result.setText(f"连接失败：{message}")
-        self._test_result.setStyleSheet("color: #c62828;")
+        set_state(self._test_result, "danger")
         self._finish_test(handle)
 
     def _finish_test(self, handle) -> None:
@@ -256,7 +257,7 @@ class SettingsDialog(QDialog):
                     config.validate()
                 except ValueError as exc:
                     self._test_result.setText(f"请完善必填项：{exc}")
-                    self._test_result.setStyleSheet("color: #c62828;")
+                    set_state(self._test_result, "danger")
                     return
                 self._manager.add(config)
         super().accept()

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -149,6 +150,91 @@ class UiSmokeTest(unittest.TestCase):
                 QSettings(str(Path(tmp) / "settings.ini"), QSettings.Format.IniFormat)
             )
             self.assertEqual(reloaded.workspace_root, tmp)
+
+    def test_workspace_combo_lists_dir_and_pick(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._make_settings(tmp)
+            window = MainWindow(settings, ProviderManager(settings))
+            combo = window._workspace_combo
+            current = str(Path(tmp).resolve())
+            # 当前目录就是选中项，最后一项固定是「选择目录…」
+            self.assertEqual(combo.currentData(), current)
+            self.assertEqual(combo.itemData(0), current)
+            self.assertEqual(combo.itemText(combo.count() - 1), "选择目录…")
+            self.assertEqual(combo.toolTip(), current)
+            window.close()
+
+    def test_workspace_switch_records_history(self) -> None:
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            settings = self._make_settings(first)
+            window = MainWindow(settings, ProviderManager(settings))
+            first_path = str(Path(first).resolve())
+            second_path = str(Path(second).resolve())
+
+            # 通过「选择目录…」切到新目录：新目录顶到最前，旧目录留在历史
+            with patch(
+                "app.ui.main_window.QFileDialog.getExistingDirectory",
+                return_value=second,
+            ):
+                window._choose_workspace()
+            self.assertEqual(str(window._workspace_root), second_path)
+            self.assertEqual(window._workspace_combo.currentData(), second_path)
+            self.assertEqual(settings.workspace_history[:2], [second_path, first_path])
+            self.assertEqual(window._workspace_combo.itemData(0), second_path)
+            self.assertEqual(
+                [window._workspace_combo.itemData(i) for i in range(2)],
+                [second_path, first_path],
+            )
+
+            # 从下拉框切回旧目录
+            index = window._workspace_combo.findData(first_path)
+            self.assertGreater(index, 0)
+            window._on_workspace_activated(index)
+            self.assertEqual(str(window._workspace_root), first_path)
+            self.assertEqual(window._workspace_combo.currentData(), first_path)
+            self.assertEqual(settings.workspace_history[0], first_path)
+
+            # 点「选择目录…」后取消：选中项回到当前目录
+            with patch(
+                "app.ui.main_window.QFileDialog.getExistingDirectory",
+                return_value="",
+            ):
+                window._on_workspace_activated(window._workspace_combo.count() - 1)
+            self.assertEqual(window._workspace_combo.currentData(), first_path)
+            window.close()
+
+    def test_missing_workspace_removed_from_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as gone:
+            gone_path = str(Path(gone).resolve())
+            settings = self._make_settings(tmp)
+            settings.workspace_history = [gone_path]
+            settings.sync()
+
+            window = MainWindow(settings, ProviderManager(settings))
+            combo = window._workspace_combo
+            index = combo.findData(gone_path)
+            self.assertGreater(index, 0)
+
+            os.rmdir(gone)
+            window._on_workspace_activated(index)
+
+            self.assertEqual(combo.findData(gone_path), -1)
+            self.assertNotIn(gone_path, settings.workspace_history)
+            # 工作区没有被切走
+            self.assertEqual(str(window._workspace_root), str(Path(tmp).resolve()))
+            self.assertEqual(combo.currentData(), str(Path(tmp).resolve()))
+            window.close()
+
+    def test_workspace_history_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._make_settings(tmp)
+            history = [str(Path(tmp).resolve()), "C:/somewhere/else"]
+            settings.workspace_history = history
+            settings.sync()
+            reloaded = Settings(
+                QSettings(str(Path(tmp) / "settings.ini"), QSettings.Format.IniFormat)
+            )
+            self.assertEqual(reloaded.workspace_history, history)
 
 
 if __name__ == "__main__":

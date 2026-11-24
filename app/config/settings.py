@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import json
+
 from PyQt6.QtCore import QByteArray, QSettings
 
 from app.constants import APP_NAME, APP_ORG
@@ -45,6 +47,25 @@ class Settings:
     @workspace_root.setter
     def workspace_root(self, value: str) -> None:
         self._q.setValue("agent/workspace_root", value)
+
+    @property
+    def workspace_history(self) -> list[str]:
+        """最近使用过的工作目录，最近的排在前面。"""
+        raw = self._q.value("agent/workspace_history_json", "[]", str)
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, str) and item.strip()]
+
+    @workspace_history.setter
+    def workspace_history(self, value: list[str]) -> None:
+        self._q.setValue(
+            "agent/workspace_history_json",
+            json.dumps(list(value), ensure_ascii=False),
+        )
 
     # ---- 窗口状态 ----
     @property
