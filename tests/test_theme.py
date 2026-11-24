@@ -96,7 +96,7 @@ class ThemeTest(unittest.TestCase):
         self.assertEqual(mono.pointSize(), 9)
 
     def test_icon_renders_every_name(self) -> None:
-        for name in ("refresh", "send", "stop", "folder", "settings"):
+        for name in ("refresh", "send", "stop", "folder", "settings", "plus", "dot"):
             result = icon(name, size=16)
             self.assertIsInstance(result, QIcon)
             self.assertFalse(result.isNull(), name)

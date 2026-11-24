@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -153,6 +154,95 @@ class SessionListWidgetTest(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertEqual(hit.data(Qt.ItemDataRole.UserRole), "b")
         self.assertEqual(seen, [])
+
+    def test_set_running_marks_only_that_item(self) -> None:
+        widget = SessionList()
+        widget.set_sessions([("a", "第一个", "tip-a"), ("b", "第二个", "")])
+
+        widget.set_running("b")
+
+        item_a, item_b = widget._list.item(0), widget._list.item(1)
+        self.assertEqual(widget.running_id(), "b")
+        # 进行中的那条：加粗 + 有圆点图标
+        self.assertTrue(item_b.font().bold())
+        self.assertFalse(item_b.icon().isNull())
+        # 其他条目不受影响
+        self.assertFalse(item_a.font().bold())
+        self.assertTrue(item_a.icon().isNull())
+        # 标题本身不被改写，拖宽也不会露出标记
+        self.assertEqual(item_b.text(), "第二个")
+
+    def test_set_running_none_clears(self) -> None:
+        widget = SessionList()
+        widget.set_sessions([("a", "第一个", "tip-a")])
+        widget.set_running("a")
+        widget.set_running(None)
+
+        item = widget._list.item(0)
+        self.assertEqual(widget.running_id(), "")
+        self.assertFalse(item.font().bold())
+        self.assertTrue(item.icon().isNull())
+        # 原始提示保留，没有残留「正在执行」
+        self.assertEqual(item.toolTip(), "tip-a")
+
+    def test_running_hint_in_tooltip(self) -> None:
+        widget = SessionList()
+        widget.set_sessions([("a", "第一个", "tip-a")])
+        widget.set_running("a")
+        self.assertIn("正在执行任务", widget._list.item(0).toolTip())
+
+    def test_rebuild_keeps_running_mark(self) -> None:
+        """列表重建（例如标题更新）后标记要还在。"""
+        widget = SessionList()
+        widget.set_sessions([("a", "旧标题", "")])
+        widget.set_running("a")
+
+        widget.set_sessions([("a", "新标题", "")])
+
+        item = widget._list.item(0)
+        self.assertEqual(item.text(), "新标题")
+        self.assertTrue(item.font().bold())
+        self.assertFalse(item.icon().isNull())
+
+    def test_set_running_unknown_id_marks_nothing(self) -> None:
+        widget = SessionList()
+        widget.set_sessions([("a", "第一个", "")])
+        widget.set_running("不存在")
+        self.assertTrue(widget._list.item(0).icon().isNull())
+
+
+class SessionListRunningStyleTest(unittest.TestCase):
+    """「进行中」样式用图标 + 粗体，而不是文字颜色。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_dot_icon_renders_visible_pixels(self) -> None:
+        from app.ui.icons import icon
+
+        pixmap = icon("dot", "#2f6feb", 10).pixmap(10, 10)
+        image = pixmap.toImage()
+        painted = sum(
+            1
+            for y in range(image.height())
+            for x in range(image.width())
+            if image.pixelColor(x, y).alpha() > 0
+        )
+        self.assertGreater(painted, 0, "圆点图标是空的，进行中状态会看不见")
+
+    def test_dot_respects_requested_color(self) -> None:
+        from app.ui.icons import icon
+
+        red = icon("dot", "#ff0000", 16).pixmap(16, 16).toImage()
+        blue = icon("dot", "#0000ff", 16).pixmap(16, 16).toImage()
+        self.assertNotEqual(red, blue)
+
+
+class ContextMenuEmptyAreaTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
 
     def test_context_menu_on_empty_area_does_not_emit(self) -> None:
         widget = SessionList()
@@ -458,6 +548,43 @@ class SessionWindowTest(unittest.TestCase):
         self.assertEqual({s.id for s in reopened._sessions}, {third, first})
         self.assertNotIn(second, {s.id for s in reopened._sessions})
         reopened.close()
+
+    def test_running_marks_session_during_task(self) -> None:
+        """提交任务后，列表里该会话显示「进行中」；任务结束清除。"""
+        window = self.make_window()
+        session_id = window._active_session_id
+        self.assertEqual(window._session_list.running_id(), "")
+
+        # 用桩替掉真实线程，避免真的去调模型
+        class _Signal:
+            def connect(self, slot) -> None:
+                pass
+
+        class _Stub:
+            result = _Signal()
+            failed = _Signal()
+
+        class _Thread:
+            finished = _Signal()
+
+        class _Handle:
+            worker = _Stub()
+            thread = _Thread()
+
+        window._manager.build_model = lambda cfg: object()
+        with patch("app.ui.main_window.run_in_thread", return_value=_Handle()):
+            window._on_submit("跑一个任务")
+
+        self.assertEqual(window._session_list.running_id(), session_id)
+        self.assertTrue(window._session_list._list.item(0).font().bold())
+
+        window._finish_task("就绪")
+        self.assertEqual(window._session_list.running_id(), "")
+        self.assertFalse(window._session_list._list.item(0).font().bold())
+
+        # 收尾：桩句柄不能留给 closeEvent 去 quit
+        window._active_handles.clear()
+        window.close()
 
     def test_new_session_button_wired(self) -> None:
         window = self.make_window()

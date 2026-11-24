@@ -43,6 +43,9 @@ _BODIES = {
     ),
     # 加号 = 新建
     "plus": '<path d="M12 5v14"/><path d="M5 12h14"/>',
+    # 实心圆点：表示「进行中」。这里必须覆盖模板的 fill/stroke，
+    # 否则圆圈只有描边，缩小到 10px 会几乎看不见
+    "dot": '<circle cx="12" cy="12" r="6" fill="currentColor" stroke="none"/>',
     # 横向滑杆 = 设置
     "settings": (
         '<line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/>'
@@ -59,6 +62,7 @@ _FALLBACKS = {
     "stop": QStyle.StandardPixmap.SP_MediaStop,
     "folder": QStyle.StandardPixmap.SP_DirIcon,
     "plus": QStyle.StandardPixmap.SP_FileDialogNewFolder,
+    "dot": QStyle.StandardPixmap.SP_DialogApplyButton,
     "settings": QStyle.StandardPixmap.SP_FileDialogDetailedView,
 }
 
@@ -91,8 +95,11 @@ def icon(name: str, color: str = "", size: int = 16) -> QIcon:
     pixmap = QPixmap(pixel_size, pixel_size)
     pixmap.fill(Qt.GlobalColor.transparent)
 
+    # body 里也要能换色（例如实心圆点），而 str.format 只作用于模板本身，
+    # 所以插进去之后再做一次 currentColor 替换
+    svg = _SVG_TEMPLATE.format(color=tint, body=body).replace("currentColor", tint)
     renderer = QSvgRenderer(
-        QByteArray(_SVG_TEMPLATE.format(color=tint, body=body).encode("utf-8"))
+        QByteArray(svg.encode("utf-8"))
     )
     painter = QPainter(pixmap)
     try:

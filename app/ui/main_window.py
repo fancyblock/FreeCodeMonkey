@@ -40,6 +40,14 @@ from app.core import ProviderManager, get_spec
 from app.ui import sound
 from app.ui.agent_bridge import AgentBridge
 from app.ui.dialogs import FilePreviewDialog, SettingsDialog
+from app.ui.export import (
+    default_bulk_export_name,
+    default_export_dir,
+    default_export_name,
+    session_to_markdown,
+    sessions_to_markdown,
+    write_markdown,
+)
 from app.ui.icons import icon
 from app.ui.sessions import DEFAULT_TITLE, Session, SessionStore, make_title
 from app.ui.widgets import (
@@ -141,13 +149,14 @@ class MainWindow(QMainWindow):
         left.addWidget(self._session_list)
         left.addWidget(self._prompt_list)
         left.setStretchFactor(0, 3)
-        left.setStretchFactor(1, 2)
+        left.setStretchFactor(1, 3)
         left.setStretchFactor(2, 2)
         left.setCollapsible(0, False)
         left.setCollapsible(1, False)
         left.setCollapsible(2, False)
         left.setMinimumWidth(180)
-        left.setSizes([290, 150, 190])
+        # 会话面板底部多了两个导出按钮，留够高度让列表至少能显示几行
+        left.setSizes([250, 220, 160])
         left.setHandleWidth(6)
 
         # 左侧整列横跨对话区与输入框；窗口变窄时优先压缩对话区
@@ -212,6 +221,8 @@ class MainWindow(QMainWindow):
         self._prompt_list.prompt_activated.connect(self._jump_to_prompt)
         self._session_list.session_activated.connect(self._on_session_activated)
         self._session_list.session_delete_requested.connect(self._on_delete_session)
+        self._session_list.export_current_requested.connect(self._on_export_current)
+        self._session_list.export_all_requested.connect(self._on_export_all)
         self._file_tree.file_activated.connect(self._open_preview)
         self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
 
@@ -425,12 +436,17 @@ class MainWindow(QMainWindow):
         self._prompt_input.reset_context()
         self._session_list.select(session.id)
 
-    def _save_active_session(self) -> None:
-        """把界面上的现状写回当前会话并落盘。"""
+    def _save_active_session(self, touch: bool = True) -> None:
+        """把界面上的现状写回当前会话并落盘。
+
+        ``touch=False`` 只同步内容、不更新修改时间——导出这类只读操作不该
+        让会话看起来「刚被编辑过」。
+        """
         session = self._active_session()
         session.entries = self._chat_view.entries()
         session.set_history(self._history)
-        session.updated_at = time.time()
+        if touch:
+            session.updated_at = time.time()
         titled = self._refresh_title(session)
         self._session_store.save(self._sessions, self._active_session_id)
         if titled:
@@ -531,6 +547,55 @@ class MainWindow(QMainWindow):
 
         self._session_store.save(self._sessions, self._active_session_id)
         self.statusBar().showMessage(f"已删除会话「{target.title}」")
+
+    # ---- 导出 ----
+    @pyqtSlot()
+    def _on_export_current(self) -> None:
+        """导出当前会话；先存档，保证导出的是屏幕上的最新内容。"""
+        self._save_active_session(touch=False)
+        session = self._active_session()
+        if session.is_empty:
+            QMessageBox.information(
+                self, "导出会话", "当前会话还没有内容，没有可导出的记录。"
+            )
+            return
+        suggested = default_export_dir() / default_export_name(session)
+        self._export_markdown(
+            suggested,
+            lambda: session_to_markdown(session),
+            f"已导出会话「{session.title}」",
+        )
+
+    @pyqtSlot()
+    def _on_export_all(self) -> None:
+        """把所有有内容的会话导出到同一个文件。"""
+        self._save_active_session(touch=False)
+        sessions = [session for session in self._sessions if not session.is_empty]
+        if not sessions:
+            QMessageBox.information(
+                self, "导出会话", "还没有任何有内容的会话，没有可导出的记录。"
+            )
+            return
+        suggested = default_export_dir() / default_bulk_export_name()
+        self._export_markdown(
+            suggested,
+            lambda: sessions_to_markdown(sessions),
+            f"已导出 {len(sessions)} 个会话",
+        )
+
+    def _export_markdown(self, suggested: Path, build, done_message: str) -> None:
+        """弹保存框、写文件、报结果；三处导出共用这一段。"""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出为 Markdown", str(suggested), "Markdown 文件 (*.md)"
+        )
+        if not path:
+            return
+        try:
+            written = write_markdown(Path(path), build())
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", f"写入文件失败：{exc}")
+            return
+        self.statusBar().showMessage(f"{done_message} → {written}")
 
     def _confirm_delete(self, session: Session) -> bool:
         """删掉就找不回来，先问一次；单独成方法方便测试替换。"""
@@ -633,6 +698,8 @@ class MainWindow(QMainWindow):
         # 线程生命周期归界面管：只有 finished 之后才允许释放句柄，
         # 提前释放会让 PyQt 销毁运行中的 QThread，进程直接崩掉。
         handle.thread.finished.connect(self._on_thread_finished)
+        # 在会话列表里标出正在跑的是哪一轮
+        self._session_list.set_running(self._active_session_id)
 
     @pyqtSlot(object)
     def _on_agent_event(self, event: AgentEvent) -> None:
@@ -697,6 +764,7 @@ class MainWindow(QMainWindow):
     def _finish_task(self, status: str) -> None:
         """只复位界面状态；句柄要等线程真正结束再由 _on_thread_finished 释放。"""
         self._prompt_input.set_running(False)
+        self._session_list.set_running(None)
         self.statusBar().showMessage(status)
 
     @pyqtSlot(str)
