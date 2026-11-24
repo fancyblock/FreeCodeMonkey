@@ -28,6 +28,8 @@
 - 左侧文件树只读：目录展开时才读盘，双击文件看带行号的内容。它不做改名或删除，
   写操作仍然只走 agent 的审批通道；agent 改过文件的任务结束后，树会自动刷新。
 - 随时可以点「停止」，在两个步骤之间生效。
+- 声音提醒：任务跑完播 `sound/mission_complete_strong_2s.mp3`，需要你确认时
+  播 `sound/question_confirmation_strong_1_5s.mp3`，不用一直盯着屏幕等。
 
 #### 软件架构
 
@@ -58,6 +60,7 @@ app/
     ├── branding.py              应用图标（窗口 / 任务栏）
     ├── assets/                  app_icon.ico（多尺寸）与 app_icon.png
     ├── sessions.py              ★ 会话模型与 JSON 持久化
+    ├── sound.py                 界面提示音：任务完成 / 需要确认（QMediaPlayer）
     ├── widgets/                 对话视图（含步骤流）、文件树、会话列表、提示词列表、输入区
     └── dialogs/                 Provider 设置、危险操作确认、文件预览
 ```

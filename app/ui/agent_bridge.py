@@ -12,6 +12,7 @@ from typing import Any
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from app.agent import ApprovalDecision, ApprovalRequest
+from app.ui import sound
 from app.ui.dialogs.approval_dialog import ApprovalDialog
 
 APPROVAL_TIMEOUT_SECONDS = 600
@@ -68,6 +69,8 @@ class AgentBridge(QObject):
     # ---- 界面线程侧 ----
     @pyqtSlot(object)
     def _on_approval_requested(self, req: ApprovalRequest) -> None:
+        # 任务在后台跑，用户可能没盯着屏幕；弹窗前先响一声
+        sound.play_confirmation()
         dialog = ApprovalDialog(req, self._parent_window)
         dialog.exec()
         self._resolve(req.request_id, dialog.decision())

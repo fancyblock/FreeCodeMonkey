@@ -37,6 +37,7 @@ from app.constants import (
     MAX_WORKSPACE_HISTORY,
 )
 from app.core import ProviderManager, get_spec
+from app.ui import sound
 from app.ui.agent_bridge import AgentBridge
 from app.ui.dialogs import FilePreviewDialog, SettingsDialog
 from app.ui.icons import icon
@@ -671,6 +672,8 @@ class MainWindow(QMainWindow):
         self._refresh_tree_if_changed()
         self._save_active_session()
         self._finish_task("就绪")
+        # 提示音：任务跑完时提醒你回来看结果
+        sound.play_completion()
 
     def _on_run_failed(self, message: str, handle) -> None:
         self._chat_view.append_system(f"错误：{message}")
