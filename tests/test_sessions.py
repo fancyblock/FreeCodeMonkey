@@ -28,7 +28,9 @@ from app.ui.sessions import (
     Session,
     SessionStore,
     default_store_path,
+    guess_workspace,
     make_title,
+    same_workspace,
 )
 from app.ui.widgets import ChatView, SessionList
 
@@ -117,6 +119,63 @@ class SessionStoreTest(unittest.TestCase):
         long_text = "很" * 40
         self.assertEqual(len(make_title(long_text)), 25)  # 24 字 + 省略号
         self.assertTrue(make_title(long_text).endswith("…"))
+
+
+class GuessWorkspaceTest(unittest.TestCase):
+    """按内容反推会话属于哪个工作区。"""
+
+    def test_paths_that_exist_under_a_root_win(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a = root / "project-a"
+            b = root / "project-b"
+            (b / "src").mkdir(parents=True)
+            (b / "src" / "main.cs").write_text("x\n", encoding="utf-8")
+            entries = [("step", "▸ read_file  src/main.cs", "", "ok")]
+
+            self.assertEqual(guess_workspace(entries, [str(a), str(b)]), str(b))
+
+    def test_directory_listing_is_evidence(self) -> None:
+        """列目录的输出里没有文件名，靠目录本身判断。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            unity = root / "unity-project"
+            (unity / "Assets" / "Game").mkdir(parents=True)
+            (unity / "ProjectSettings").mkdir()
+            plain = root / "plain-project"
+            plain.mkdir()
+            entries = [
+                ("step", "→ list_dir", "# .（depth=1）\nAssets/\nProjectSettings/", "ok")
+            ]
+
+            self.assertEqual(guess_workspace(entries, [str(plain), str(unity)]), str(unity))
+
+    def test_full_path_and_directory_name_are_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a = root / "alpha"
+            b = root / "beta"
+            a.mkdir()
+            b.mkdir()
+            entries = [("sys", f"工作区已切换到 {b}")]
+            self.assertEqual(guess_workspace(entries, [str(a), str(b)]), str(b))
+            # 只提到目录名也算线索
+            self.assertEqual(
+                guess_workspace([("msg", "user", "帮 beta 加个功能")], [str(a), str(b)]),
+                str(b),
+            )
+
+    def test_no_clue_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            entries = [("msg", "user", "你好")]
+            self.assertEqual(guess_workspace(entries, [tmp]), "")
+            self.assertEqual(guess_workspace([], [tmp]), "")
+            self.assertEqual(guess_workspace(entries, []), "")
+
+    def test_tie_prefers_the_first_candidate(self) -> None:
+        # 两个目录名同样出现一次时，保留候选列表里靠前的（调用方把当前工作区放最前）
+        entries = [("msg", "user", "alpha 和 beta 都看一下")]
+        self.assertEqual(guess_workspace(entries, ["alpha", "beta"]), "alpha")
 
 
 class SessionListWidgetTest(unittest.TestCase):
@@ -324,11 +383,15 @@ class SessionWindowTest(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def make_window(self) -> MainWindow:
+    def make_window(
+        self, workspace: Path | None = None, history: list[Path] | None = None
+    ) -> MainWindow:
         settings = Settings(
             QSettings(str(self.root / "s.ini"), QSettings.Format.IniFormat)
         )
-        settings.workspace_root = str(self.root)
+        settings.workspace_root = str(workspace or self.root)
+        if history:
+            settings.workspace_history = [str(path.resolve()) for path in history]
         # 配一个假 provider：输入区才会启用，按钮的可用状态也才有意义
         config = ProviderConfig(
             id="p1",
@@ -442,13 +505,249 @@ class SessionWindowTest(unittest.TestCase):
         from app.constants import MAX_SESSIONS
 
         window = self.make_window()
+        workspace = str(window._workspace_root)
         # 预置满额会话，再新建一个应该把最旧的挤掉
-        window._sessions = [Session.create(now=float(i)) for i in range(MAX_SESSIONS)]
+        window._sessions = [
+            Session.create(now=float(i), workspace=workspace)
+            for i in range(MAX_SESSIONS)
+        ]
         window._active_session_id = window._sessions[0].id
-        oldest_id = window._sessions[-1].id
+        oldest_id = min(
+            window._sessions, key=lambda session: session.created_at
+        ).id
         window._on_new_session()
         self.assertEqual(len(window._sessions), MAX_SESSIONS)
         self.assertNotIn(oldest_id, {s.id for s in window._sessions})
+        window.close()
+
+    def test_session_cap_is_per_workspace(self) -> None:
+        from app.constants import MAX_SESSIONS
+
+        window = self.make_window()
+        workspace = str(window._workspace_root)
+        other = self.root / "other-project"
+        other.mkdir()
+        # 另一个工作区也存满会话；当前工作区新建时不该动它们的
+        window._sessions = [
+            Session.create(now=float(i), workspace=str(other.resolve()))
+            for i in range(MAX_SESSIONS)
+        ]
+        window._sessions.append(
+            Session.create(now=900.0, workspace=workspace)
+        )
+        window._active_session_id = window._sessions[-1].id
+
+        window._on_new_session()
+
+        self.assertEqual(
+            len(window._workspace_sessions()), 2
+        )  # 原来那轮 + 新建的
+        self.assertEqual(
+            len([s for s in window._sessions if s.workspace == str(other.resolve())]),
+            MAX_SESSIONS,
+        )
+        window.close()
+
+    def test_switch_workspace_swaps_sessions_and_chat(self) -> None:
+        """切换工作区时，会话列表、提示词列表与对话区一起换。"""
+        window = self.make_window()
+        window._chat_view.append_message("user", "A 里的提问")
+        window._prompt_list.add_prompt("A 里的提问", "msg-0")
+        window._save_active_session()
+        a_session_id = window._active_session_id
+
+        other = self.root / "other-project"
+        other.mkdir()
+        window._apply_workspace(other.resolve())
+
+        # 新工作区从空白开始：只有一轮空会话，看不到 A 的内容
+        self.assertEqual(window._session_list.count(), 1)
+        self.assertNotEqual(window._active_session_id, a_session_id)
+        self.assertEqual(window._prompt_list.count(), 0)
+        self.assertNotIn("A 里的提问", window._chat_view.toPlainText())
+
+        window._chat_view.append_message("user", "B 里的提问")
+        window._prompt_list.add_prompt("B 里的提问", "msg-0")
+        window._save_active_session()
+        b_session_id = window._active_session_id
+
+        # 切回 A：列表、提示词与对话都回到 A 自己的状态
+        window._apply_workspace(self.root.resolve())
+        self.assertEqual(window._active_session_id, a_session_id)
+        self.assertEqual(window._session_list.count(), 1)
+        self.assertEqual(window._prompt_list.count(), 1)
+        self.assertIn("A 里的提问", window._chat_view.toPlainText())
+        self.assertNotIn("B 里的提问", window._chat_view.toPlainText())
+        # 两轮的会话都还在，只是各归各的工作区
+        self.assertEqual({s.id for s in window._sessions}, {a_session_id, b_session_id})
+        window.close()
+
+    def test_workspace_sessions_persist_across_restart(self) -> None:
+        window = self.make_window()
+        window._chat_view.append_message("user", "A 里的内容")
+        window._save_active_session()
+        a_session_id = window._active_session_id
+
+        other = self.root / "other-project"
+        other.mkdir()
+        window._apply_workspace(other.resolve())
+        window._chat_view.append_message("user", "B 里的内容")
+        window._save_active_session()
+        b_session_id = window._active_session_id
+        window.close()
+
+        # 以 B 为当前工作区重启：只看到 B 自己的会话
+        reopened = self.make_window(other.resolve())
+        self.assertEqual([s.id for s in reopened._workspace_sessions()], [b_session_id])
+        self.assertIn("B 里的内容", reopened._chat_view.toPlainText())
+        reopened.close()
+
+        # 再以 A 重启：A 的记录原样回来，B 的不混进来
+        back = self.make_window(self.root.resolve())
+        self.assertEqual([s.id for s in back._workspace_sessions()], [a_session_id])
+        self.assertIn("A 里的内容", back._chat_view.toPlainText())
+        self.assertNotIn("B 里的内容", back._chat_view.toPlainText())
+        back.close()
+
+    def _write_legacy_store(self, sessions: list[dict], active: str = "") -> None:
+        """写一份老格式（version 1、会话里没有 workspace）的会话文件。"""
+        self.store_path.write_text(
+            json.dumps(
+                {"version": 1, "active": active, "sessions": sessions},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    def test_legacy_session_without_clues_adopts_current_workspace(self) -> None:
+        # 老版本存的会话既没有 workspace 字段、内容里也没有线索
+        legacy = Session.create(now=1.0)
+        data = legacy.to_dict()
+        data.pop("workspace")
+        self._write_legacy_store([data], legacy.id)
+
+        window = self.make_window()
+
+        self.assertEqual([s.id for s in window._workspace_sessions()], [legacy.id])
+        self.assertEqual(window._active_session_id, legacy.id)
+        window.close()
+
+    def test_session_missing_workspace_is_not_hidden(self) -> None:
+        """新格式文件里个别会话缺归属时，也要落到当前工作区，不能看不见。"""
+        orphan = Session.create(now=1.0)
+        orphan.entries = [("msg", "user", "别让我消失")]
+        SessionStore(self.store_path).save([orphan], orphan.id)
+        # 模拟把字段写丢
+        payload = json.loads(self.store_path.read_text(encoding="utf-8"))
+        payload["sessions"][0].pop("workspace", None)
+        self.store_path.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+
+        window = self.make_window()
+
+        self.assertEqual([s.id for s in window._workspace_sessions()], [orphan.id])
+        self.assertIn("别让我消失", window._chat_view.toPlainText())
+        window.close()
+
+    def test_legacy_sessions_are_split_by_content(self) -> None:
+        """旧数据里混着几个项目的会话：按内容各回各家，不能全归当前工作区。"""
+        here = self.root.resolve()
+        # 另一个项目：有一个真实存在的文件，会话里提到它
+        other = self.root / "unity-project"
+        (other / "Assets" / "Game").mkdir(parents=True)
+        (other / "Assets" / "Game" / "Hud.cs").write_text("class Hud {}\n", encoding="utf-8")
+
+        mine = Session.create(now=2.0)
+        mine.entries = [("msg", "user", "改一下本项目的 sessions.py")]
+        theirs = Session.create(now=1.0)
+        theirs.entries = [
+            ("msg", "user", "看看 HUD"),
+            ("step", "▸ read_file  Assets/Game/Hud.cs", "class Hud", "ok"),
+        ]
+        self._write_legacy_store(
+            [mine.to_dict() | {"workspace": ""}, theirs.to_dict() | {"workspace": ""}],
+            theirs.id,
+        )
+
+        # 另一个项目在历史目录里，推断时才会被当成候选
+        window = self.make_window(history=[other])
+
+        by_id = {s.id: s for s in window._sessions}
+        self.assertTrue(same_workspace(by_id[mine.id].workspace, self.root))
+        self.assertTrue(same_workspace(by_id[theirs.id].workspace, other))
+        # 当前工作区只看得到自己的那一轮
+        self.assertEqual([s.id for s in window._workspace_sessions()], [mine.id])
+        window.close()
+
+    def test_migrated_workspace_is_persisted(self) -> None:
+        """推断结果要落盘：下次启动不能再按陈旧数据重算。"""
+        other = self.root / "unity-project"
+        (other / "Assets").mkdir(parents=True)
+        (other / "Assets" / "Hud.cs").write_text("x\n", encoding="utf-8")
+        theirs = Session.create(now=1.0)
+        theirs.entries = [("step", "▸ read_file  Assets/Hud.cs", "", "ok")]
+        data = theirs.to_dict() | {"workspace": ""}
+        self._write_legacy_store([data], theirs.id)
+
+        window = self.make_window(history=[other])
+        window.close()
+
+        sessions, _active = SessionStore(self.store_path).load()
+        saved = next((s for s in sessions if s.id == theirs.id), None)
+        self.assertIsNotNone(saved)
+        self.assertEqual(str(Path(saved.workspace).resolve()), str(other.resolve()))
+        # 文件已升级到新版本，旧数据不会再被当成「待迁移」
+        payload = json.loads(self.store_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["version"], SessionStore.VERSION)
+
+    def test_switch_workspace_does_not_write_into_session(self) -> None:
+        """切换工作区只更新状态栏，不能往新工作区的会话里塞记录。"""
+        window = self.make_window()
+        other = self.root / "other-project"
+        other.mkdir()
+        window._apply_workspace(other.resolve())
+
+        self.assertEqual(window._chat_view.entries(), [])
+        self.assertEqual(window._session_list.count(), 1)
+        self.assertIn("工作区已切换", window.statusBar().currentMessage())
+        window.close()
+
+    def test_move_session_to_another_workspace(self) -> None:
+        window = self.make_window()
+        window._chat_view.append_message("user", "其实是在另一个项目做的")
+        window._save_active_session()
+        moved_id = window._active_session_id
+
+        other = self.root / "other-project"
+        other.mkdir()
+        window._workspace_history = [str(other.resolve())]
+        window._sync_session_list()
+        self.assertEqual(window._session_list.move_targets(),
+                         [(other.name, str(other.resolve()))])
+
+        window._on_move_session(moved_id, str(other.resolve()))
+
+        by_id = {s.id: s for s in window._sessions}
+        self.assertTrue(same_workspace(by_id[moved_id].workspace, other))
+        # 当前工作区自动换成了另一轮空白会话，列表里也不再出现它
+        self.assertNotEqual(window._active_session_id, moved_id)
+        self.assertEqual(window._session_list.count(), 1)
+        self.assertNotIn(moved_id, {s.id for s in window._workspace_sessions()})
+        self.assertEqual(window._chat_view.toPlainText(), "")
+        window.close()
+
+    def test_move_blocked_while_running(self) -> None:
+        window = self.make_window()
+        moved_id = window._active_session_id
+        other = self.root / "other-project"
+        other.mkdir()
+        window._active_handles = [object()]
+
+        window._on_move_session(moved_id, str(other.resolve()))
+
+        self.assertTrue(same_workspace(window._active_session().workspace, self.root))
+        window._active_handles = []
         window.close()
 
     def test_clear_history_resets_title(self) -> None:

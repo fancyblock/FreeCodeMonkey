@@ -55,7 +55,14 @@ from app.ui.export import (
     write_markdown,
 )
 from app.ui.icons import icon
-from app.ui.sessions import DEFAULT_TITLE, Session, SessionStore, make_title
+from app.ui.sessions import (
+    DEFAULT_TITLE,
+    Session,
+    SessionStore,
+    guess_workspace,
+    make_title,
+    same_workspace,
+)
 from app.ui.widgets import (
     ChatView,
     FileTree,
@@ -232,6 +239,7 @@ class MainWindow(QMainWindow):
         self._prompt_list.prompt_activated.connect(self._jump_to_prompt)
         self._session_list.session_activated.connect(self._on_session_activated)
         self._session_list.session_delete_requested.connect(self._on_delete_session)
+        self._session_list.session_move_requested.connect(self._on_move_session)
         self._session_list.export_current_requested.connect(self._on_export_current)
         self._session_list.export_all_requested.connect(self._on_export_all)
         self._file_tree.file_activated.connect(self._open_preview)
@@ -385,8 +393,14 @@ class MainWindow(QMainWindow):
         self._apply_workspace(path.resolve())
 
     def _apply_workspace(self, root: Path) -> None:
-        """切换工作区：更新配置、文件树与下拉列表。"""
+        """切换工作区：更新配置、文件树、下拉列表与会话界面。
+
+        会话是按工作区隔离的：先把当前内容存回旧工作区的会话，再铺开
+        目标工作区自己的会话列表、提示词与对话记录。
+        """
         previous = self._workspace_root
+        # 先存档，切回来时还能接着看
+        self._save_active_session()
         self._workspace_root = root
         self._settings.workspace_root = str(root)
         # 先把上一个目录留在历史里，再把新目录顶到最前
@@ -395,7 +409,10 @@ class MainWindow(QMainWindow):
         self._sync_workspace_combo()
         self._file_tree.set_root(root)
         self._files_changed = False
-        self._chat_view.append_system(f"工作区已切换到 {root}")
+        self._activate_workspace_session()
+        self._session_store.save(self._sessions, self._active_session_id)
+        # 只写在状态栏：对话区现在装的是这个工作区自己的会话，别往里塞无关记录
+        self.statusBar().showMessage(f"工作区已切换到 {root}")
 
     @pyqtSlot(str)
     def _open_preview(self, rel_path: str) -> None:
@@ -404,22 +421,85 @@ class MainWindow(QMainWindow):
 
     # ---- 会话 ----
     def _restore_sessions(self) -> None:
-        """启动时读出会话列表，并把上次激活的那个还原到界面。"""
+        """启动时读出会话列表，并铺开当前工作区上次用的那一轮。"""
         sessions, active_id = self._session_store.load()
-        self._sessions = sessions[:MAX_SESSIONS]
-        if not self._sessions:
-            self._sessions = [Session.create()]
-        known = {session.id for session in self._sessions}
-        self._active_session_id = active_id if active_id in known else self._sessions[0].id
+        self._sessions = sessions
+        # 旧版本不分工作区；新版本里也可能有个别会话缺归属（数据被改坏之类）
+        reconsider_all = self._session_store.loaded_version < SessionStore.VERSION
+        fixable = reconsider_all or any(not s.workspace for s in sessions)
+        if fixable:
+            self._reassign_workspaces(reconsider_all)
+        self._activate_workspace_session(active_id)
+        if fixable:
+            # 修正结果马上落盘，下次启动不用再推断
+            self._session_store.save(self._sessions, self._active_session_id)
+
+    def _reassign_workspaces(self, reconsider_all: bool = False) -> None:
+        """给会话补上「属于哪个工作区」。
+
+        旧版本把所有会话存在一起、不记目录，只能按内容反推：记录里出现过
+        某个目录的路径或名字，或者提到的文件确实长在那个目录下。
+        ``reconsider_all=False`` 时只处理缺归属的那些，不推翻已有结论。
+        推断不出又完全没有归属的，归到当前工作区，至少不会丢。
+        """
+        candidates = [str(self._workspace_root), *self._workspace_history]
+        for session in self._sessions:
+            if session.workspace and not reconsider_all:
+                continue
+            guessed = guess_workspace(session.entries, candidates)
+            session.workspace = (
+                guessed or session.workspace or str(self._workspace_root)
+            )
+
+    def _workspace_sessions(self) -> list[Session]:
+        """当前工作区的会话，顺序与列表一致（新的在前）。"""
+        return [
+            session
+            for session in self._sessions
+            if same_workspace(session.workspace, self._workspace_root)
+        ]
+
+    def _activate_workspace_session(self, prefer_id: str = "") -> Session:
+        """把界面切到当前工作区自己的会话。
+
+        优先还原 ``prefer_id``（启动时记下的那轮），否则挑最近编辑过的；
+        这个工作区还没有任何会话时就开一轮空白会话。
+        """
+        sessions = self._workspace_sessions()
+        if not sessions:
+            session = Session.create(workspace=str(self._workspace_root))
+            self._sessions.insert(0, session)
+            sessions = [session]
+        target = next(
+            (session for session in sessions if session.id == prefer_id), None
+        )
+        if target is None:
+            target = max(sessions, key=lambda session: session.updated_at)
+        self._active_session_id = target.id
         self._sync_session_list()
-        self._load_session_content(self._active_session())
+        self._load_session_content(target)
+        return target
+
+    def _trim_workspace_sessions(self) -> None:
+        """每个工作区各自限量；超出只丢本工作区创建时间最早的。"""
+        sessions = sorted(
+            self._workspace_sessions(),
+            key=lambda session: session.created_at,
+            reverse=True,
+        )
+        if len(sessions) <= MAX_SESSIONS:
+            return
+        doomed = {session.id for session in sessions[MAX_SESSIONS:]}
+        self._sessions = [
+            session for session in self._sessions if session.id not in doomed
+        ]
 
     def _active_session(self) -> Session:
         for session in self._sessions:
             if session.id == self._active_session_id:
                 return session
         # 兜底：数据被外部改坏时补一个，避免后续到处判空
-        session = Session.create()
+        session = Session.create(workspace=str(self._workspace_root))
         self._sessions.insert(0, session)
         self._active_session_id = session.id
         return session
@@ -431,10 +511,50 @@ class MainWindow(QMainWindow):
                 session.title,
                 time.strftime("%Y-%m-%d %H:%M", time.localtime(session.created_at)),
             )
-            for session in self._sessions
+            for session in self._workspace_sessions()
         ]
+        self._session_list.set_move_targets(self._move_targets())
         self._session_list.set_sessions(rows)
         self._session_list.select(self._active_session_id)
+
+    def _move_targets(self) -> list[tuple[str, str]]:
+        """右键「移动到其他工作区」可选的目录：用过的、且不是当前这个。
+
+        显示名优先用目录名，重名时退回完整路径，免得两项看起来一模一样。
+        """
+        paths = [
+            path
+            for path in self._workspace_history
+            if not same_workspace(path, self._workspace_root)
+        ]
+        names = [Path(path).name or path for path in paths]
+        return [
+            (name if names.count(name) == 1 else path, path)
+            for name, path in zip(names, paths)
+        ]
+
+    @pyqtSlot(str, str)
+    def _on_move_session(self, session_id: str, workspace: str) -> None:
+        """把某个会话改到另一个工作区；它会从当前列表里消失。"""
+        if self._active_handles:
+            self.statusBar().showMessage("任务执行中，等它结束再移动会话。")
+            return
+        target = next(
+            (item for item in self._sessions if item.id == session_id), None
+        )
+        if target is None or same_workspace(target.workspace, workspace):
+            return
+
+        # 先把界面上的内容存回会话，移动的是最新的一份
+        self._save_active_session()
+        was_active = target.id == self._active_session_id
+        target.workspace = workspace
+        if was_active:
+            self._activate_workspace_session()
+        else:
+            self._sync_session_list()
+        self._session_store.save(self._sessions, self._active_session_id)
+        self.statusBar().showMessage(f"已把会话「{target.title}」移到 {workspace}")
 
     def _load_session_content(self, session: Session) -> None:
         """把某个会话的记录铺回对话区与提示词列表，并恢复 agent 记忆。"""
@@ -504,6 +624,10 @@ class MainWindow(QMainWindow):
         if target is None:
             self._restore_sessions()
             return
+        if not same_workspace(target.workspace, self._workspace_root):
+            # 列表只展示当前工作区的会话，别的工作区的不该被切进来
+            self._sync_session_list()
+            return
         self._switch_session(target)
         self.statusBar().showMessage(f"已切换到会话「{target.title}」")
 
@@ -514,10 +638,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("任务执行中，等它结束再新建会话。")
             return
         self._save_active_session()
-        session = Session.create()
+        session = Session.create(workspace=str(self._workspace_root))
         self._sessions.insert(0, session)
-        # 超出上限只丢最旧的；刚建的这个在最前面，不会被丢
-        del self._sessions[MAX_SESSIONS:]
+        # 超出上限只丢本工作区最旧的；刚建的这个在最前面，不会被丢
+        self._trim_workspace_sessions()
         self._active_session_id = session.id
         self._sync_session_list()
         self._load_session_content(session)
@@ -537,19 +661,22 @@ class MainWindow(QMainWindow):
             return
 
         was_active = target.id == self._active_session_id
-        index = self._sessions.index(target)
+        # 只在当前工作区里挑接替的会话，别的工作区不参与
+        sessions = self._workspace_sessions()
+        index = sessions.index(target) if target in sessions else 0
         self._sessions.remove(target)
+        remaining = [session for session in sessions if session.id != target.id]
 
-        if not self._sessions:
-            # 至少留一个空白会话，否则界面没有可编辑的目标
-            replacement = Session.create()
+        if not remaining:
+            # 这个工作区至少留一个空白会话，否则界面没有可编辑的目标
+            replacement = Session.create(workspace=str(self._workspace_root))
             self._sessions.append(replacement)
             self._active_session_id = replacement.id
             self._sync_session_list()
             self._load_session_content(replacement)
         elif was_active:
             # 用原来的位置接着往后挑一个，没有就取前一个
-            neighbour = self._sessions[min(index, len(self._sessions) - 1)]
+            neighbour = remaining[min(index, len(remaining) - 1)]
             self._active_session_id = neighbour.id
             self._sync_session_list()
             self._load_session_content(neighbour)
@@ -579,9 +706,12 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def _on_export_all(self) -> None:
-        """把所有有内容的会话导出到同一个文件。"""
+        """把当前工作区里所有有内容的会话导出到同一个文件。"""
         self._save_active_session(touch=False)
-        sessions = [session for session in self._sessions if not session.is_empty]
+        # 导出的是当前工作区里的会话，别的项目的不会被混进来
+        sessions = [
+            session for session in self._workspace_sessions() if not session.is_empty
+        ]
         if not sessions:
             QMessageBox.information(
                 self, "导出会话", "还没有任何有内容的会话，没有可导出的记录。"

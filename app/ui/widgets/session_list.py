@@ -35,6 +35,8 @@ class SessionList(QWidget):
 
     session_activated = pyqtSignal(str)
     session_delete_requested = pyqtSignal(str)
+    # (会话 id, 目标工作区路径)：把会话改到另一个工作区
+    session_move_requested = pyqtSignal(str, str)
     export_current_requested = pyqtSignal()
     export_all_requested = pyqtSignal()
 
@@ -43,6 +45,8 @@ class SessionList(QWidget):
         self._list = QListWidget()
         # 当前正在执行任务的会话；空串表示没有
         self._running_id = ""
+        # 右键菜单里「移动到其他工作区」的候选：(显示名, 目录)
+        self._move_targets: list[tuple[str, str]] = []
         self._build_ui()
         self._connect_signals()
 
@@ -104,9 +108,19 @@ class SessionList(QWidget):
         # 右键不改变选中项：删除别的会话不应让当前高亮跳走
         menu = QMenu(self)
         delete_action = menu.addAction("删除会话")
+        # id 里的目标目录：归属推断错了时由用户自己纠正
+        moves: dict[object, str] = {}
+        if self._move_targets:
+            submenu = menu.addMenu("移动到其他工作区")
+            for label, path in self._move_targets:
+                action = submenu.addAction(label)
+                action.setToolTip(path)
+                moves[action] = path
         chosen = menu.exec(self._list.viewport().mapToGlobal(pos))
         if chosen is delete_action:
             self.session_delete_requested.emit(str(session_id))
+        elif chosen in moves:
+            self.session_move_requested.emit(str(session_id), moves[chosen])
 
     # ---- 对外接口 ----
     def set_sessions(self, sessions: list[tuple[str, str, str]]) -> None:
@@ -126,6 +140,14 @@ class SessionList(QWidget):
             self._refresh_items()
         finally:
             self._list.blockSignals(False)
+
+    def set_move_targets(self, targets: list[tuple[str, str]]) -> None:
+        """设置右键「移动到其他工作区」的候选；传空列表就不显示这一项。"""
+        self._move_targets = list(targets)
+
+    def move_targets(self) -> list[tuple[str, str]]:
+        """当前可选的移动目标 (显示名, 目录)。"""
+        return list(self._move_targets)
 
     def set_running(self, session_id: str | None) -> None:
         """标记正在执行任务的会话；传 None 表示没有。"""
