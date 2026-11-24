@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor, QTextOption
 from PyQt6.QtWidgets import QTextBrowser, QTextEdit, QWidget
 
 from app.ui.theme import palette
@@ -46,6 +47,12 @@ class ChatView(QTextBrowser):
         super().__init__(parent)
         self.setReadOnly(True)
         self.setOpenExternalLinks(True)
+        self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        # 对话区只纵向滚动：宽度不够时一律折行，不出现水平滚动条
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        option = self.document().defaultTextOption()
+        option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.document().setDefaultTextOption(option)
         self.document().setDocumentMargin(16)
         # 空状态用 placeholder：不会写进文档，清空后 toPlainText() 仍为空
         self.setPlaceholderText("描述你想让 agent 完成的编程任务，按 Ctrl+Enter 发送…")
@@ -119,7 +126,7 @@ class ChatView(QTextBrowser):
             html.append(f'<span style="color:{color};">{_escape(title)}</span>')
         if body:
             html.append(
-                '<pre style="margin:4px 0 0 10px;'
+                '<pre style="margin:4px 0 0 10px;white-space:pre-wrap;'
                 f"font-family:{_MONO_STACK};font-size:11px;"
                 f'color:{tokens.text_faint};">{_block(body)}</pre>'
             )

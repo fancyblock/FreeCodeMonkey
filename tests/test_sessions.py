@@ -293,6 +293,21 @@ class ChatViewReplayTest(unittest.TestCase):
         prompts = view.replay([None, [], ["msg"], ["unknown", "x"], ["msg", "user", "ok"]])
         self.assertEqual(prompts, [("ok", "msg-0")])
 
+    def test_long_lines_wrap_instead_of_scrolling_horizontally(self) -> None:
+        view = ChatView()
+        view.resize(320, 240)
+        view.show()
+        self.app.processEvents()
+        # 步骤输出走 <pre>，消息是普通段落；两种都不能把视图撑宽
+        view.append_step("▸ run_command", "x" * 300)
+        view.append_message("user", "y" * 300)
+        self.app.processEvents()
+        self.assertEqual(
+            view.horizontalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.assertEqual(view.horizontalScrollBar().maximum(), 0)
+        view.close()
+
 
 class SessionWindowTest(unittest.TestCase):
     """主窗口里的新建 / 切换 / 持久化行为。"""
