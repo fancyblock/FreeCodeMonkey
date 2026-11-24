@@ -31,7 +31,7 @@ from .events import AgentEvent
 from .prompts import PROMPTS
 from .tools import Workspace
 
-MAX_STEPS = 25
+MAX_STEPS = 200
 HISTORY_LIMIT = 40
 EVENT_PREVIEW_CHARS = 500
 CONTEXT_CHAR_BUDGET = 40_000
