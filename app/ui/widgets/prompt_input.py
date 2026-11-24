@@ -1,4 +1,4 @@
-"""输入区：Agent 模式下拉 + 多行文本输入 + 发送 / 停止按钮。"""
+"""输入区：确认卡 + Agent 模式下拉 + 多行文本输入 + 发送 / 停止按钮。"""
 
 from __future__ import annotations
 
@@ -15,9 +15,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.agent import ApprovalRequest
 from app.constants import DEFAULT_CONTEXT_WINDOW
 from app.ui.icons import icon
 from app.ui.theme import context_level, palette, repolish
+from app.ui.widgets.approval_panel import ApprovalPanel
 
 _MODE_OPTIONS = (
     ("plan", "Plan", "只读：分析代码并给出修改计划，不改文件也不执行命令"),
@@ -45,9 +47,12 @@ class PromptInput(QWidget):
     stop_requested = pyqtSignal()
     mode_changed = pyqtSignal(str)
     new_session_requested = pyqtSignal()
+    approval_resolved = pyqtSignal(str, object)  # request_id, ApprovalDecision
+    approval_size_changed = pyqtSignal()  # 卡片展开 / 收起参数后的高度变化
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._approval = ApprovalPanel()
         self._edit = _PromptEdit()
         self._mode_combo = QComboBox()
         self._context_bar = QProgressBar()
@@ -100,6 +105,9 @@ class PromptInput(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        # 确认卡贴在输入框正上方，出现时顶起输入区而不是盖住对话
+        layout.addWidget(self._approval)
         layout.addWidget(self._edit)
         layout.addLayout(buttons)
 
@@ -109,6 +117,12 @@ class PromptInput(QWidget):
         self._stop_button.clicked.connect(self.stop_requested.emit)
         self._edit.submit_shortcut.connect(self._emit_text)
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self._approval.resolved.connect(self.approval_resolved.emit)
+        self._approval.height_changed.connect(self._on_approval_size_changed)
+
+    def _on_approval_size_changed(self) -> None:
+        self.updateGeometry()
+        self.approval_size_changed.emit()
 
     def _on_mode_changed(self, index: int) -> None:
         mode = self._mode_combo.itemData(index)
@@ -155,6 +169,25 @@ class PromptInput(QWidget):
 
     def clear(self) -> None:
         self._edit.clear()
+
+    # ---- 审批卡 ----
+    def show_approval(self, request: ApprovalRequest) -> None:
+        """把一次待确认的工具调用放进输入区。"""
+        self._approval.set_request(request)
+
+    def clear_approval(self, request_id: str | None = None) -> None:
+        """收起审批卡；给了 request_id 时只收对应的那张。"""
+        self._approval.clear(request_id)
+
+    def pending_request_id(self) -> str:
+        return self._approval.pending_request_id()
+
+    def has_pending_approval(self) -> bool:
+        return self._approval.has_pending()
+
+    def approval_height(self) -> int:
+        """确认卡要多占的高度（含与输入框之间的间距）。"""
+        return self._approval.sizeHint().height() + 6
 
     def set_running(self, running: bool) -> None:
         """任务进行中：禁用输入与发送，显示停止按钮。"""

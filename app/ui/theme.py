@@ -216,6 +216,14 @@ QComboBox QAbstractItemView {
 }
 QPlainTextEdit[role="code"] { background: $surface_alt; border: 1px solid $border; }
 
+/* ---- 输入区里的审批卡 ---- */
+QFrame#approvalPanel {
+    background: $surface;
+    border: 1px solid $danger;
+    border-radius: 8px;
+}
+QFrame#approvalPanel QLabel { background: transparent; }
+
 /* ---- 列表与树 ---- */
 QTreeWidget, QListWidget {
     background: $surface;

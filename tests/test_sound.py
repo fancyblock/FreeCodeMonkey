@@ -8,6 +8,8 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -94,28 +96,50 @@ class SoundModuleTest(unittest.TestCase):
 
 
 class ApprovalSoundTest(unittest.TestCase):
-    """弹出确认框时应该响；命中「本会话已允许」而直接放行时不该响。"""
+    """确认卡出现时应该响；命中「本会话已允许」而直接放行时不该响。"""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
-        import app.ui.agent_bridge as bridge_module
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        settings = Settings(
+            QSettings(str(self.root / "s.ini"), QSettings.Format.IniFormat)
+        )
+        settings.workspace_root = str(self.root)
+        config = ProviderConfig(
+            id="p1",
+            type="openai_compatible",
+            values={"name": "fake", "api_key": "sk-test", "model": "fake-model"},
+        )
+        settings.providers_json = ProviderStore.dumps([config])
+        settings.active_provider_id = "p1"
+        self.window = MainWindow(
+            settings, ProviderManager(settings), SessionStore(self.root / "s.json")
+        )
+        self.window.show()
 
         sound.reset()
         self.played: list[str] = []
-        self._original_dialog = bridge_module.ApprovalDialog
         self._original_confirm = sound.play_confirmation
         sound.play_confirmation = lambda: self.played.append("confirm") or True
-        self.bridge = bridge_module.AgentBridge()
+
+        from app.ui.agent_bridge import AgentBridge
+
+        self.bridge = AgentBridge(self.window)
+        self.bridge.approval_requested.connect(self.window._on_approval_requested)
+        self.bridge.approval_expired.connect(self.window._on_approval_expired)
+        # 真实流程里由 _on_submit 挂上，这里手工接上同一个对象
+        self.window._bridge = self.bridge
 
     def tearDown(self) -> None:
-        import app.ui.agent_bridge as bridge_module
-
-        bridge_module.ApprovalDialog = self._original_dialog
         sound.play_confirmation = self._original_confirm
+        self.window._bridge = None
+        self.window.close()
         sound.reset()
+        self._tmp.cleanup()
 
     def _make_request(self) -> ApprovalRequest:
         return ApprovalRequest(
@@ -125,61 +149,50 @@ class ApprovalSoundTest(unittest.TestCase):
             detail='{"command": "pytest -q"}',
         )
 
-    def _stub_dialog(self, allowed: bool) -> None:
-        import app.ui.agent_bridge as bridge_module
-
-        class Stub:
-            def __init__(self, request, parent=None) -> None:
-                self.request = request
-
-            def exec(self) -> int:
-                return 1
-
-            def decision(self) -> ApprovalDecision:
-                return ApprovalDecision(allowed=allowed, reason="stub")
-
-        bridge_module.ApprovalDialog = Stub
-
-    def test_sound_plays_when_dialog_shown(self) -> None:
-        self._stub_dialog(allowed=True)
-        self.assertTrue(self.bridge.request(self._make_request()).allowed)
+    def _start_request(self, request: ApprovalRequest):
+        """在工作线程里发起审批（和 runtime 一样阻塞），等界面铺开确认卡。"""
+        result: dict[str, ApprovalDecision] = {}
+        thread = threading.Thread(
+            target=lambda: result.update(decision=self.bridge.request(request)),
+            daemon=True,
+        )
+        thread.start()
+        deadline = time.monotonic() + 5
+        while (
+            time.monotonic() < deadline
+            and not self.window._prompt_input.has_pending_approval()
+        ):
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.assertEqual(
+            self.window._prompt_input.pending_request_id(), request.request_id
+        )
         self.assertEqual(self.played, ["confirm"])
+        return thread, result
+
+    def test_sound_plays_when_panel_shown(self) -> None:
+        request = self._make_request()
+        thread, result = self._start_request(request)
+
+        self.window._prompt_input._approval._allow_button.click()
+        thread.join(timeout=5)
+        self.assertTrue(result["decision"].allowed)
+        self.assertFalse(self.window._prompt_input.has_pending_approval())
 
     def test_no_sound_when_already_remembered(self) -> None:
-        """第二次同类操作直接放行、不弹窗，也就不该再响。"""
-        self._stub_dialog(allowed=True)
-        first = ApprovalRequest(
-            tool="run_command",
-            args={"command": "a"},
-            title="a",
-            detail="{}",
-        )
-        # 让第一次的结论带上「记住」
-        import app.ui.agent_bridge as bridge_module
-
-        class RememberingStub:
-            def __init__(self, request, parent=None) -> None:
-                self.request = request
-
-            def exec(self) -> int:
-                return 1
-
-            def decision(self) -> ApprovalDecision:
-                return ApprovalDecision(allowed=True, remember=True, reason="stub")
-
-        bridge_module.ApprovalDialog = RememberingStub
-        self.bridge.request(first)
+        """第二次同类操作直接放行、不铺确认卡，也就不该再响。"""
+        first = self._make_request()
+        thread, _ = self._start_request(first)
+        panel = self.window._prompt_input._approval
+        panel._remember.setChecked(True)
+        panel._allow_button.click()
+        thread.join(timeout=5)
         self.played.clear()
 
-        # 第二次同类操作命中已记住的规则，直接返回、不弹窗
-        second = ApprovalRequest(
-            tool="run_command",
-            args={"command": "b"},
-            title="b",
-            detail="{}",
-        )
-        self.assertTrue(self.bridge.request(second).allowed)
+        # 第二次同类操作命中已记住的规则，直接返回、不出卡
+        self.assertTrue(self.bridge.request(self._make_request()).allowed)
         self.assertEqual(self.played, [])
+        self.assertFalse(self.window._prompt_input.has_pending_approval())
 
 
 class CompletionSoundHookTest(unittest.TestCase):

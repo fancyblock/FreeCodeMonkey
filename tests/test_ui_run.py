@@ -1,6 +1,6 @@
 """端到端测试：真跑一遍窗口 → 工作线程 → 审批 → 回灌 → 渲染。
 
-模型仍是假的，但线程、信号、弹窗、事件渲染都是真的。
+模型仍是假的，但线程、信号、输入区确认卡、事件渲染都是真的。
 运行：.venv\\Scripts\\python.exe tests\\test_ui_run.py
 """
 
@@ -20,7 +20,6 @@ from langchain_core.messages import AIMessage
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication
 
-from app.agent import ApprovalDecision
 from app.config import Settings
 from app.core import ProviderConfig, ProviderManager, ProviderStore
 from app.ui import MainWindow
@@ -30,38 +29,18 @@ from test_agent_loop import ScriptedChatModel, tool_call
 ALLOWED = {"value": True}
 
 
-class StubApprovalDialog:
-    """替掉真正的模态弹窗，直接返回预设结论。"""
-
-    def __init__(self, request, parent=None) -> None:
-        self.request = request
-
-    def exec(self) -> int:
-        return 1
-
-    def decision(self) -> ApprovalDecision:
-        return ApprovalDecision(allowed=ALLOWED["value"], reason="stub")
-
-
 class EndToEndTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
-        import app.ui.agent_bridge as bridge_module
-
-        self._original_dialog = bridge_module.ApprovalDialog
-        bridge_module.ApprovalDialog = StubApprovalDialog
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         (self.root / "hello.py").write_text('print("hello")\n', encoding="utf-8")
         ALLOWED["value"] = True
 
     def tearDown(self) -> None:
-        import app.ui.agent_bridge as bridge_module
-
-        bridge_module.ApprovalDialog = self._original_dialog
         self._tmp.cleanup()
 
     def build_window(self, model: ScriptedChatModel) -> MainWindow:
@@ -85,12 +64,23 @@ class EndToEndTest(unittest.TestCase):
         return window
 
     def wait_for_idle(self, window: MainWindow, timeout: float = 20.0) -> None:
+        """跑事件循环直到任务结束；途中遇到确认卡就替用户点一下。"""
+        answered: set[str] = set()
         deadline = time.monotonic() + timeout
         while window._active_handles and time.monotonic() < deadline:
             self.app.processEvents()
+            request_id = window._prompt_input.pending_request_id()
+            if request_id and request_id not in answered:
+                answered.add(request_id)
+                panel = window._prompt_input._approval
+                if ALLOWED["value"]:
+                    panel._allow_button.click()
+                else:
+                    panel._reject_button.click()
             time.sleep(0.01)
         self.app.processEvents()
         self.assertFalse(window._active_handles, "任务在超时前没有结束")
+        self.assertFalse(window._prompt_input.has_pending_approval(), "确认卡没有收起")
 
     def test_full_loop_with_approved_edit(self) -> None:
         model = ScriptedChatModel(

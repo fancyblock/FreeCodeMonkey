@@ -23,8 +23,8 @@ from app.config import Settings
 from app.constants import APP_NAME
 from app.core import ProviderConfig, ProviderManager
 from app.ui import MainWindow
-from app.ui.dialogs import ApprovalDialog
 from app.ui.sessions import SessionStore
+from app.ui.widgets import ApprovalPanel
 
 
 class UiSmokeTest(unittest.TestCase):
@@ -112,16 +112,69 @@ class UiSmokeTest(unittest.TestCase):
             self.assertFalse(window._chat_view.scroll_to_mark(first))
             window.close()
 
-    def test_approval_dialog_defaults_to_deny(self) -> None:
+    def test_approval_panel_waits_for_explicit_choice(self) -> None:
+        """卡片出现本身不代表放行；没有点击就没有结论。"""
         request = ApprovalRequest(
             tool="run_command",
             args={"command": "rm -rf build"},
             title="rm -rf build",
             detail='{"command": "rm -rf build"}',
         )
-        dialog = ApprovalDialog(request)
-        self.assertFalse(dialog.decision().allowed)
-        dialog.close()
+        panel = ApprovalPanel()
+        decisions = []
+        panel.resolved.connect(lambda rid, decision: decisions.append((rid, decision)))
+
+        panel.set_request(request)
+        self.assertEqual(panel.pending_request_id(), request.request_id)
+        self.assertFalse(panel.isHidden())
+        self.assertEqual(decisions, [])
+        # 提示语按运行时真实工具名匹配，而不是笼统的兜底文案
+        self.assertIn("shell 命令", panel._hint_label.text())
+
+        panel._reject_button.click()
+        self.assertEqual(panel.pending_request_id(), "")
+        self.assertTrue(panel.isHidden())
+        self.assertEqual(decisions[0][0], request.request_id)
+        self.assertFalse(decisions[0][1].allowed)
+
+    def test_approval_panel_allow_remembers(self) -> None:
+        request = ApprovalRequest(
+            tool="edit_file",
+            args={"path": "a.py"},
+            title="a.py · 1 行 → 2 行",
+            detail="{}",
+        )
+        panel = ApprovalPanel()
+        decisions = []
+        panel.resolved.connect(lambda rid, decision: decisions.append(decision))
+        panel.set_request(request)
+        panel._remember.setChecked(True)
+        panel._allow_button.click()
+
+        self.assertTrue(decisions[0].allowed)
+        self.assertTrue(decisions[0].remember)
+
+    def test_approval_panel_shows_in_input_area(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._make_settings(tmp)
+            window = self._make_window(settings)
+            window.show()
+            request = ApprovalRequest(
+                tool="edit_file",
+                args={"path": "a.py"},
+                title="a.py · 1 行 → 2 行",
+                detail="{}",
+            )
+            window._prompt_input.show_approval(request)
+            self.assertTrue(window._prompt_input._approval.isVisible())
+            self.assertEqual(window._prompt_input.pending_request_id(), request.request_id)
+
+            # 超时之类的失效通知只收对应那张卡
+            window._on_approval_expired("other-request", "等待确认超时")
+            self.assertTrue(window._prompt_input.has_pending_approval())
+            window._on_approval_expired(request.request_id, "等待确认超时")
+            self.assertFalse(window._prompt_input.has_pending_approval())
+            window.close()
 
     def test_context_bar_reflects_usage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

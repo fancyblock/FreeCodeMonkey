@@ -1,7 +1,8 @@
 """把 agent 的跨线程需求接到 Qt 上。
 
-runtime 在工作线程里调用 request() 并阻塞等待；本类把请求转发到界面线程弹窗，
-拿到结论后唤醒工作线程。共享状态一律加锁，避免界面与工作线程互相踩。
+runtime 在工作线程里调用 request() 并阻塞等待；本类把请求转发到界面线程（主窗口
+在输入区里铺一张确认卡），拿到结论后唤醒工作线程。共享状态一律加锁，避免界面与
+工作线程互相踩。
 """
 
 from __future__ import annotations
@@ -9,11 +10,9 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, pyqtSignal
 
 from app.agent import ApprovalDecision, ApprovalRequest
-from app.ui import sound
-from app.ui.dialogs.approval_dialog import ApprovalDialog
 
 APPROVAL_TIMEOUT_SECONDS = 600
 
@@ -28,15 +27,14 @@ class AgentBridge(QObject):
 
     agent_event = pyqtSignal(object)
     approval_requested = pyqtSignal(object)
+    # request_id, 失效原因；界面据此收起已经没意义的确认卡
+    approval_expired = pyqtSignal(str, str)
 
     def __init__(self, parent_window: Any = None) -> None:
         super().__init__(parent_window)
-        self._parent_window = parent_window
         self._lock = threading.Lock()
         self._pending: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
         self._remembered: set[str] = set()
-        # 队列连接：emit 发生在工作线程，槽函数回到界面线程执行
-        self.approval_requested.connect(self._on_approval_requested)
 
     # ---- 工作线程侧 ----
     def request(self, req: ApprovalRequest) -> ApprovalDecision:
@@ -54,6 +52,8 @@ class AgentBridge(QObject):
         with self._lock:
             entry = self._pending.pop(req.request_id, None)
         if not finished:
+            # 卡片一直没人点：告诉界面把它收起来，免得停在一个早已失效的请求上
+            self.approval_expired.emit(req.request_id, "等待确认超时")
             return ApprovalDecision(allowed=False, reason="等待确认超时")
         if entry is None:
             return ApprovalDecision(allowed=False, reason="确认请求已失效")
@@ -67,15 +67,8 @@ class AgentBridge(QObject):
         return decision
 
     # ---- 界面线程侧 ----
-    @pyqtSlot(object)
-    def _on_approval_requested(self, req: ApprovalRequest) -> None:
-        # 任务在后台跑，用户可能没盯着屏幕；弹窗前先响一声
-        sound.play_confirmation()
-        dialog = ApprovalDialog(req, self._parent_window)
-        dialog.exec()
-        self._resolve(req.request_id, dialog.decision())
-
-    def _resolve(self, request_id: str, decision: ApprovalDecision) -> None:
+    def resolve(self, request_id: str, decision: ApprovalDecision) -> None:
+        """界面给出结论：唤醒等待中的工作线程。重复结论会被忽略。"""
         with self._lock:
             entry = self._pending.get(request_id)
             if entry is None:
@@ -84,14 +77,11 @@ class AgentBridge(QObject):
             box["decision"] = decision
         signal_done.set()
 
-    # ---- 供测试使用 ----
-    def resolve_for_test(self, request_id: str, decision: ApprovalDecision) -> None:
-        self._resolve(request_id, decision)
-
     # ---- 退出时清理 ----
     def abort_pending(self, reason: str = "程序正在退出") -> None:
         """把还没结论的审批全部判为拒绝，让工作线程能往下走。"""
         with self._lock:
             pending = list(self._pending.items())
         for request_id, _ in pending:
-            self._resolve(request_id, ApprovalDecision(allowed=False, reason=reason))
+            self.resolve(request_id, ApprovalDecision(allowed=False, reason=reason))
+            self.approval_expired.emit(request_id, reason)

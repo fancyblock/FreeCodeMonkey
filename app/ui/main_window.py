@@ -25,7 +25,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.agent import AgentEvent, AgentRuntime, Workspace
+from app.agent import (
+    AgentEvent,
+    AgentRuntime,
+    ApprovalDecision,
+    ApprovalRequest,
+    Workspace,
+)
 from app.agent import events as E
 from app.agent.runtime import summarize_call, trim_history
 from app.config import Settings
@@ -92,6 +98,8 @@ class MainWindow(QMainWindow):
         self._workspace_history = self._load_workspace_history()
         # 本次任务是否改过文件；任务结束时决定要不要刷新文件树
         self._files_changed = False
+        # 确认卡出现前的上下分栏比例，确认完按原样还回去
+        self._input_sizes: list[int] | None = None
 
         self._chat_view = ChatView()
         self._prompt_input = PromptInput()
@@ -142,6 +150,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 1)
         splitter.setHandleWidth(6)
+        self._main_splitter = splitter
 
         # 左栏上中下三段：文件树 / 会话 / 提示词，中间都可拖动
         left = QSplitter(Qt.Orientation.Vertical)
@@ -218,6 +227,8 @@ class MainWindow(QMainWindow):
         self._prompt_input.submitted.connect(self._on_submit)
         self._prompt_input.stop_requested.connect(self._on_stop)
         self._prompt_input.new_session_requested.connect(self._on_new_session)
+        self._prompt_input.approval_resolved.connect(self._on_approval_resolved)
+        self._prompt_input.approval_size_changed.connect(self._fit_input_pane)
         self._prompt_list.prompt_activated.connect(self._jump_to_prompt)
         self._session_list.session_activated.connect(self._on_session_activated)
         self._session_list.session_delete_requested.connect(self._on_delete_session)
@@ -636,6 +647,7 @@ class MainWindow(QMainWindow):
                 self._release_handle(handle)
 
         # 关窗前把当前会话存下来，下次启动能接着看
+        self._prompt_input.clear_approval()
         self._save_active_session()
         self._settings.geometry = self.saveGeometry()
         self._settings.sync()
@@ -681,6 +693,9 @@ class MainWindow(QMainWindow):
 
         bridge = AgentBridge(self)
         bridge.agent_event.connect(self._on_agent_event)
+        # 审批请求从工作线程发出，队列投递回界面线程铺确认卡
+        bridge.approval_requested.connect(self._on_approval_requested)
+        bridge.approval_expired.connect(self._on_approval_expired)
         runtime = AgentRuntime(
             model,
             workspace,
@@ -700,6 +715,58 @@ class MainWindow(QMainWindow):
         handle.thread.finished.connect(self._on_thread_finished)
         # 在会话列表里标出正在跑的是哪一轮
         self._session_list.set_running(self._active_session_id)
+
+    # ---- 审批 ----
+    @pyqtSlot(object)
+    def _on_approval_requested(self, request: ApprovalRequest) -> None:
+        """把待确认的调用摆到输入区，任务线程继续在后台等着。"""
+        # 任务在后台跑，用户可能没盯着屏幕；卡片出现前先响一声
+        sound.play_confirmation()
+        self._prompt_input.show_approval(request)
+        self._fit_input_pane()
+        self.statusBar().showMessage(f"等待你确认 {request.tool}…")
+
+    @pyqtSlot(str, object)
+    def _on_approval_resolved(self, request_id: str, decision: ApprovalDecision) -> None:
+        """用户在确认卡上点了「允许执行」或「拒绝」。"""
+        if self._bridge is not None:
+            self._bridge.resolve(request_id, decision)
+        self._restore_input_pane()
+        self.statusBar().showMessage("已允许执行" if decision.allowed else "已拒绝该操作")
+
+    @pyqtSlot(str, str)
+    def _on_approval_expired(self, request_id: str, reason: str) -> None:
+        """请求已失效（超时或任务被中止）：收起卡片，别让界面停在旧请求上。"""
+        self._prompt_input.clear_approval(request_id)
+        self._restore_input_pane()
+        self.statusBar().showMessage(reason)
+        if reason == "等待确认超时":
+            self._chat_view.append_system("等待确认超时，已按拒绝处理。")
+
+    def _fit_input_pane(self) -> None:
+        """让输入区刚好容下确认卡：展开 / 收起参数时按新高度重排一次。"""
+        sizes = self._main_splitter.sizes()
+        if len(sizes) != 2:
+            return
+        if self._input_sizes is None:
+            self._input_sizes = sizes
+        total = sum(sizes)
+        self._prompt_input.updateGeometry()
+        # 只加确认卡本身的高度，输入框仍是用户拖出来的大小
+        base = self._input_sizes[1]
+        target = base + self._prompt_input.approval_height()
+        # 无论如何给对话区留一点位置，否则确认卡会把它挤没
+        target = min(target, max(140, total - 200))
+        target = max(target, 140)
+        self._main_splitter.setSizes([max(total - target, 120), target])
+
+    def _restore_input_pane(self) -> None:
+        """确认结束后把上下分栏还给用户原来的比例。"""
+        if self._input_sizes is None:
+            return
+        sizes = self._input_sizes
+        self._input_sizes = None
+        self._main_splitter.setSizes(sizes)
 
     @pyqtSlot(object)
     def _on_agent_event(self, event: AgentEvent) -> None:
@@ -758,11 +825,21 @@ class MainWindow(QMainWindow):
     def _on_stop(self) -> None:
         if self._runtime is None:
             return
+        # 正卡在确认上的话，先按拒绝放行，否则线程要一直等到超时才动
+        request_id = self._prompt_input.pending_request_id()
+        if request_id and self._bridge is not None:
+            self._bridge.resolve(
+                request_id, ApprovalDecision(allowed=False, reason="用户停止了任务")
+            )
+            self._prompt_input.clear_approval(request_id)
+            self._restore_input_pane()
         self._runtime.cancel()
         self.statusBar().showMessage("已请求停止，当前步骤结束后生效…")
 
     def _finish_task(self, status: str) -> None:
         """只复位界面状态；句柄要等线程真正结束再由 _on_thread_finished 释放。"""
+        self._prompt_input.clear_approval()
+        self._restore_input_pane()
         self._prompt_input.set_running(False)
         self._session_list.set_running(None)
         self.statusBar().showMessage(status)
