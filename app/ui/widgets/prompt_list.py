@@ -33,8 +33,8 @@ class PromptList(QWidget):
         title = QLabel("提示词")
         title.setStyleSheet("color:#5f6368;font-weight:600;padding:2px 2px 4px 2px;")
 
+        # 宽度交给外层分栏决定：用户拉宽左列时这里应该跟着变宽
         self._list.setMinimumWidth(140)
-        self._list.setMaximumWidth(280)
         self._list.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._list.setWordWrap(False)
         self._list.setUniformItemSizes(True)

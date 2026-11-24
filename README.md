@@ -21,6 +21,8 @@
 - **上下文占用条**：发送按钮左侧实时显示本次请求的估算 token 占模型上下文窗口的比例，≥60% 变橙、≥85% 变红。
 - 每次工具调用都以步骤行形式出现在对话区，你能看清它在做什么。
 - 左侧列表按顺序记录本会话的每条提示词，点击即可跳回对话区对应位置并高亮。
+- 左侧文件树只读：目录展开时才读盘，双击文件看带行号的内容。它不做改名或删除，
+  写操作仍然只走 agent 的审批通道；agent 改过文件的任务结束后，树会自动刷新。
 - 随时可以点「停止」，在两个步骤之间生效。
 
 #### 软件架构
@@ -47,8 +49,8 @@ app/
 └── ui/
     ├── main_window.py           装配：工作区 + Provider + 事件渲染
     ├── agent_bridge.py          跨线程审批通道（工作线程 ↔ 界面线程）
-    ├── widgets/                 对话视图（含步骤流）、提示词列表、输入区
-    └── dialogs/                 Provider 设置、危险操作确认
+    ├── widgets/                 对话视图（含步骤流）、文件树、提示词列表、输入区
+    └── dialogs/                 Provider 设置、危险操作确认、文件预览
 ```
 
 关键边界：`app/agent` 里没有一行 Qt 代码。循环只依赖两个注入项——事件回调与审批通道。
@@ -124,6 +126,7 @@ python -m venv .venv
 .venv\Scripts\python.exe tests\test_codeintel.py     # 语法工具：结构、符号、语法检查
 .venv\Scripts\python.exe tests\test_ui_smoke.py      # 界面装配，offscreen，不需要显示器
 .venv\Scripts\python.exe tests\test_ui_run.py        # 端到端：线程 → 审批 → 回灌 → 渲染
+.venv\Scripts\python.exe tests\test_file_tree.py     # 文件树懒加载与预览弹窗
 ```
 
 `test_ui_run.py` 里唯一被替换的是模型和确认弹窗，线程、跨线程信号、事件渲染都是真的。
@@ -133,6 +136,8 @@ python -m venv .venv
 
 - 没有 token 级流式输出：中间步骤实时可见，但最终回答是一次性出现的。
 - 对话历史只存在内存里，关闭即失；超过 40 条会自动截断。
+- 文件预览是一次性快照：打开时读一次，之后文件变了不会自己跟着变，重新双击即可。
+  单个目录超过 500 条只显示前 500 条。
 - 没有沙箱与网络白名单，安全全靠审批。
 - 只有语法级理解：没有 LSP，不支持跳转定义、跨文件引用分析或类型推导；
   tree-sitter 目前只接了 Python（加语言只需在 `syntax.py` 的 `GRAMMARS` 里登记）。

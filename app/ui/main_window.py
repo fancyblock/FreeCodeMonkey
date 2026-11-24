@@ -32,9 +32,12 @@ from app.config import Settings
 from app.constants import APP_NAME, APP_VERSION, DEFAULT_CONTEXT_WINDOW
 from app.core import ProviderManager, get_spec
 from app.ui.agent_bridge import AgentBridge
-from app.ui.dialogs import SettingsDialog
-from app.ui.widgets import ChatView, PromptInput, PromptList
+from app.ui.dialogs import FilePreviewDialog, SettingsDialog
+from app.ui.widgets import ChatView, FileTree, PromptInput, PromptList
 from app.workers import release_handle, run_in_thread
+
+# 会改动工作区文件系统的工具；新增写类工具时要在这里登记
+_MUTATING_TOOLS = frozenset({"edit_file", "run_command"})
 
 
 class MainWindow(QMainWindow):
@@ -51,10 +54,13 @@ class MainWindow(QMainWindow):
         self._runtime: AgentRuntime | None = None
         self._bridge: AgentBridge | None = None
         self._workspace_root = self._initial_workspace()
+        # 本次任务是否改过文件；任务结束时决定要不要刷新文件树
+        self._files_changed = False
 
         self._chat_view = ChatView()
         self._prompt_input = PromptInput()
         self._prompt_list = PromptList()
+        self._file_tree = FileTree()
         self._provider_combo = QComboBox()
         self._workspace_label = QLabel()
 
@@ -64,6 +70,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._refresh_providers()
         self._refresh_workspace_label()
+        self._file_tree.set_root(self._workspace_root)
         self._restore_state()
 
     # ---- 构建 ----
@@ -91,14 +98,27 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 1)
 
-        # 左侧提示词列表横跨对话区与输入框；窗口变窄时优先压缩对话区
+        # 左栏上下分：文件树在上、提示词列表在下，中间可拖动
+        left = QSplitter(Qt.Orientation.Vertical)
+        left.addWidget(self._file_tree)
+        left.addWidget(self._prompt_list)
+        left.setStretchFactor(0, 3)
+        left.setStretchFactor(1, 2)
+        left.setCollapsible(0, False)
+        left.setCollapsible(1, False)
+        left.setMinimumWidth(180)
+        left.setSizes([320, 200])
+
+        # 左侧整列横跨对话区与输入框；窗口变窄时优先压缩对话区
         body = QSplitter(Qt.Orientation.Horizontal)
-        body.addWidget(self._prompt_list)
+        body.addWidget(left)
         body.addWidget(splitter)
         body.setStretchFactor(0, 0)
         body.setStretchFactor(1, 1)
         body.setCollapsible(0, False)
-        body.setSizes([200, 820])
+        body.setSizes([260, 760])
+        self._body_splitter = body
+        self._left_splitter = left
 
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -143,6 +163,7 @@ class MainWindow(QMainWindow):
         self._prompt_input.submitted.connect(self._on_submit)
         self._prompt_input.stop_requested.connect(self._on_stop)
         self._prompt_list.prompt_activated.connect(self._jump_to_prompt)
+        self._file_tree.file_activated.connect(self._open_preview)
         self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
 
     # ---- Provider ----
@@ -213,7 +234,14 @@ class MainWindow(QMainWindow):
         self._settings.workspace_root = str(self._workspace_root)
         self._settings.sync()
         self._refresh_workspace_label()
+        self._file_tree.set_root(self._workspace_root)
+        self._files_changed = False
         self._chat_view.append_system(f"工作区已切换到 {self._workspace_root}")
+
+    @pyqtSlot(str)
+    def _open_preview(self, rel_path: str) -> None:
+        """双击文件树里的文件：弹只读预览。"""
+        FilePreviewDialog(self._workspace_root, rel_path, self).exec()
 
     # ---- 状态持久化 ----
     def _restore_state(self) -> None:
@@ -277,6 +305,7 @@ class MainWindow(QMainWindow):
 
         mark = self._chat_view.append_message("user", task)
         self._prompt_list.add_prompt(task, mark)
+        self._files_changed = False
         self._prompt_input.clear()
         self._prompt_input.set_running(True)
         self.statusBar().showMessage(f"正在调用 {config.name}（{mode}）…")
@@ -319,6 +348,9 @@ class MainWindow(QMainWindow):
             tone = "ok" if event.ok else "bad"
             self._chat_view.append_step(f"{mark} {event.tool}", event.text, tone)
             self.statusBar().showMessage(f"{event.tool} 完成")
+            # 一个任务里可能改很多次；只记标记，任务结束再统一刷新一次
+            if event.ok and event.tool in _MUTATING_TOOLS:
+                self._files_changed = True
         elif kind == E.DENIED:
             self._chat_view.append_step(f"✗ 已拒绝 {event.tool}", event.text, "bad")
             self.statusBar().showMessage("你拒绝了一个操作")
@@ -333,11 +365,20 @@ class MainWindow(QMainWindow):
 
     def _on_run_done(self, messages: list[BaseMessage], handle) -> None:
         self._history = trim_history(list(messages))
+        self._refresh_tree_if_changed()
         self._finish_task("就绪")
 
     def _on_run_failed(self, message: str, handle) -> None:
         self._chat_view.append_system(f"错误：{message}")
+        self._refresh_tree_if_changed()
         self._finish_task("出错")
+
+    def _refresh_tree_if_changed(self) -> None:
+        """只有 agent 真的改过文件才重建文件树，纯读任务不动它。"""
+        if not self._files_changed:
+            return
+        self._files_changed = False
+        self._file_tree.refresh()
 
     def _on_stop(self) -> None:
         if self._runtime is None:
