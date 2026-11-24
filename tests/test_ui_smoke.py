@@ -24,12 +24,20 @@ from app.constants import APP_NAME
 from app.core import ProviderConfig, ProviderManager
 from app.ui import MainWindow
 from app.ui.dialogs import ApprovalDialog
+from app.ui.sessions import SessionStore
 
 
 class UiSmokeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+        # 每个窗口配一个临时会话文件，测试之间互不影响，也不碰真实用户数据
+        cls._store_dirs: list[tempfile.TemporaryDirectory] = []
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        for directory in cls._store_dirs:
+            directory.cleanup()
 
     def _make_settings(self, directory: str) -> Settings:
         qsettings = QSettings(str(Path(directory) / "settings.ini"), QSettings.Format.IniFormat)
@@ -37,10 +45,16 @@ class UiSmokeTest(unittest.TestCase):
         settings.workspace_root = directory
         return settings
 
+    def _make_window(self, settings: Settings) -> MainWindow:
+        store_dir = tempfile.TemporaryDirectory()
+        type(self)._store_dirs.append(store_dir)
+        store = SessionStore(Path(store_dir.name) / "sessions.json")
+        return MainWindow(settings, ProviderManager(settings), store)
+
     def test_window_builds_without_provider(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = self._make_settings(tmp)
-            window = MainWindow(settings, ProviderManager(settings))
+            window = self._make_window(settings)
             window.show()
             self.assertTrue(window.windowTitle().startswith(APP_NAME))
             # 没有 provider 时输入区整体禁用，避免用户白输入
@@ -59,7 +73,7 @@ class UiSmokeTest(unittest.TestCase):
     def test_prompt_list_records_and_jumps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = self._make_settings(tmp)
-            window = MainWindow(settings, ProviderManager(settings))
+            window = self._make_window(settings)
             window.show()
             # 让两条提示词相隔较远，才能验证「跳转」确实改变了滚动位置
             for index in range(30):
@@ -112,7 +126,7 @@ class UiSmokeTest(unittest.TestCase):
     def test_context_bar_reflects_usage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = self._make_settings(tmp)
-            window = MainWindow(settings, ProviderManager(settings))
+            window = self._make_window(settings)
             window.show()
 
             bar = window._prompt_input._context_bar
@@ -154,7 +168,7 @@ class UiSmokeTest(unittest.TestCase):
     def test_workspace_combo_lists_dir_and_pick(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = self._make_settings(tmp)
-            window = MainWindow(settings, ProviderManager(settings))
+            window = self._make_window(settings)
             combo = window._workspace_combo
             current = str(Path(tmp).resolve())
             # 当前目录就是选中项，最后一项固定是「选择目录…」
@@ -167,7 +181,7 @@ class UiSmokeTest(unittest.TestCase):
     def test_workspace_switch_records_history(self) -> None:
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             settings = self._make_settings(first)
-            window = MainWindow(settings, ProviderManager(settings))
+            window = self._make_window(settings)
             first_path = str(Path(first).resolve())
             second_path = str(Path(second).resolve())
 
@@ -210,7 +224,7 @@ class UiSmokeTest(unittest.TestCase):
             settings.workspace_history = [gone_path]
             settings.sync()
 
-            window = MainWindow(settings, ProviderManager(settings))
+            window = self._make_window(settings)
             combo = window._workspace_combo
             index = combo.findData(gone_path)
             self.assertGreater(index, 0)

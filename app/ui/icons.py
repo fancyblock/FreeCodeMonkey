@@ -41,6 +41,8 @@ _BODIES = {
         '<path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9'
         'l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/>'
     ),
+    # 加号 = 新建
+    "plus": '<path d="M12 5v14"/><path d="M5 12h14"/>',
     # 横向滑杆 = 设置
     "settings": (
         '<line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/>'
@@ -56,6 +58,7 @@ _FALLBACKS = {
     "send": QStyle.StandardPixmap.SP_ArrowUp,
     "stop": QStyle.StandardPixmap.SP_MediaStop,
     "folder": QStyle.StandardPixmap.SP_DirIcon,
+    "plus": QStyle.StandardPixmap.SP_FileDialogNewFolder,
     "settings": QStyle.StandardPixmap.SP_FileDialogDetailedView,
 }
 

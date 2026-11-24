@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from langchain_core.messages import BaseMessage
@@ -32,13 +33,21 @@ from app.constants import (
     APP_NAME,
     APP_VERSION,
     DEFAULT_CONTEXT_WINDOW,
+    MAX_SESSIONS,
     MAX_WORKSPACE_HISTORY,
 )
 from app.core import ProviderManager, get_spec
 from app.ui.agent_bridge import AgentBridge
 from app.ui.dialogs import FilePreviewDialog, SettingsDialog
 from app.ui.icons import icon
-from app.ui.widgets import ChatView, FileTree, PromptInput, PromptList
+from app.ui.sessions import DEFAULT_TITLE, Session, SessionStore, make_title
+from app.ui.widgets import (
+    ChatView,
+    FileTree,
+    PromptInput,
+    PromptList,
+    SessionList,
+)
 from app.workers import release_handle, run_in_thread
 
 # 会改动工作区文件系统的工具；新增写类工具时要在这里登记
@@ -51,10 +60,19 @@ _WORKSPACE_PICK = "__pick_directory__"
 class MainWindow(QMainWindow):
     """应用主窗口。"""
 
-    def __init__(self, settings: Settings, manager: ProviderManager) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        manager: ProviderManager,
+        session_store: SessionStore | None = None,
+    ) -> None:
         super().__init__()
         self._settings = settings
         self._manager = manager
+        # 测试与多实例场景可以注入自己的存储位置
+        self._session_store = session_store or SessionStore()
+        self._sessions: list[Session] = []
+        self._active_session_id = ""
         # 保持任务句柄的引用，防止被垃圾回收导致线程提前销毁
         self._active_handles: list = []
         # 会话内的多轮消息（不持久化）
@@ -69,6 +87,7 @@ class MainWindow(QMainWindow):
         self._chat_view = ChatView()
         self._prompt_input = PromptInput()
         self._prompt_list = PromptList()
+        self._session_list = SessionList()
         self._file_tree = FileTree()
         self._provider_combo = QComboBox()
         self._workspace_combo = QComboBox()
@@ -81,6 +100,7 @@ class MainWindow(QMainWindow):
         self._sync_workspace_combo()
         self._file_tree.set_root(self._workspace_root)
         self._restore_state()
+        self._restore_sessions()
 
     # ---- 构建 ----
     def _build_ui(self) -> None:
@@ -114,16 +134,19 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setHandleWidth(6)
 
-        # 左栏上下分：文件树在上、提示词列表在下，中间可拖动
+        # 左栏上中下三段：文件树 / 会话 / 提示词，中间都可拖动
         left = QSplitter(Qt.Orientation.Vertical)
         left.addWidget(self._file_tree)
+        left.addWidget(self._session_list)
         left.addWidget(self._prompt_list)
         left.setStretchFactor(0, 3)
         left.setStretchFactor(1, 2)
+        left.setStretchFactor(2, 2)
         left.setCollapsible(0, False)
         left.setCollapsible(1, False)
+        left.setCollapsible(2, False)
         left.setMinimumWidth(180)
-        left.setSizes([320, 200])
+        left.setSizes([290, 150, 190])
         left.setHandleWidth(6)
 
         # 左侧整列横跨对话区与输入框；窗口变窄时优先压缩对话区
@@ -184,7 +207,10 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self._prompt_input.submitted.connect(self._on_submit)
         self._prompt_input.stop_requested.connect(self._on_stop)
+        self._prompt_input.new_session_requested.connect(self._on_new_session)
         self._prompt_list.prompt_activated.connect(self._jump_to_prompt)
+        self._session_list.session_activated.connect(self._on_session_activated)
+        self._session_list.session_delete_requested.connect(self._on_delete_session)
         self._file_tree.file_activated.connect(self._open_preview)
         self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
 
@@ -353,6 +379,169 @@ class MainWindow(QMainWindow):
         """双击文件树里的文件：弹只读预览。"""
         FilePreviewDialog(self._workspace_root, rel_path, self).exec()
 
+    # ---- 会话 ----
+    def _restore_sessions(self) -> None:
+        """启动时读出会话列表，并把上次激活的那个还原到界面。"""
+        sessions, active_id = self._session_store.load()
+        self._sessions = sessions[:MAX_SESSIONS]
+        if not self._sessions:
+            self._sessions = [Session.create()]
+        known = {session.id for session in self._sessions}
+        self._active_session_id = active_id if active_id in known else self._sessions[0].id
+        self._sync_session_list()
+        self._load_session_content(self._active_session())
+
+    def _active_session(self) -> Session:
+        for session in self._sessions:
+            if session.id == self._active_session_id:
+                return session
+        # 兜底：数据被外部改坏时补一个，避免后续到处判空
+        session = Session.create()
+        self._sessions.insert(0, session)
+        self._active_session_id = session.id
+        return session
+
+    def _sync_session_list(self) -> None:
+        rows = [
+            (
+                session.id,
+                session.title,
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(session.created_at)),
+            )
+            for session in self._sessions
+        ]
+        self._session_list.set_sessions(rows)
+        self._session_list.select(self._active_session_id)
+
+    def _load_session_content(self, session: Session) -> None:
+        """把某个会话的记录铺回对话区与提示词列表，并恢复 agent 记忆。"""
+        user_prompts = self._chat_view.replay(session.entries)
+        self._prompt_list.clear_prompts()
+        for text, mark in user_prompts:
+            self._prompt_list.add_prompt(text, mark)
+        self._history = session.history()
+        self._files_changed = False
+        self._prompt_input.reset_context()
+        self._session_list.select(session.id)
+
+    def _save_active_session(self) -> None:
+        """把界面上的现状写回当前会话并落盘。"""
+        session = self._active_session()
+        session.entries = self._chat_view.entries()
+        session.set_history(self._history)
+        session.updated_at = time.time()
+        titled = self._refresh_title(session)
+        self._session_store.save(self._sessions, self._active_session_id)
+        if titled:
+            self._sync_session_list()
+
+    @staticmethod
+    def _refresh_title(session: Session) -> bool:
+        """还没有标题时，用第一条用户消息补上；返回标题是否变了。
+
+        调用前 session.entries 必须已经是最新的（_save_active_session 会先同步）。
+        """
+        if session.title != DEFAULT_TITLE:
+            return False
+        for entry in session.entries:
+            if (
+                isinstance(entry, (list, tuple))
+                and len(entry) >= 3
+                and entry[0] == "msg"
+                and entry[1] == "user"
+            ):
+                session.title = make_title(str(entry[2]))
+                return True
+        return False
+
+    def _switch_session(self, session: Session) -> None:
+        """切到另一个会话：先存档当前，再铺开目标会话。"""
+        self._save_active_session()
+        self._active_session_id = session.id
+        self._load_session_content(session)
+        self._session_store.save(self._sessions, self._active_session_id)
+
+    @pyqtSlot(str)
+    def _on_session_activated(self, session_id: str) -> None:
+        """双击会话列表里的一项。"""
+        if self._active_handles:
+            self.statusBar().showMessage("任务执行中，等它结束再切换会话。")
+            self._session_list.select(self._active_session_id)
+            return
+        if not session_id or session_id == self._active_session_id:
+            return
+        target = next(
+            (item for item in self._sessions if item.id == session_id), None
+        )
+        if target is None:
+            self._restore_sessions()
+            return
+        self._switch_session(target)
+        self.statusBar().showMessage(f"已切换到会话「{target.title}」")
+
+    @pyqtSlot()
+    def _on_new_session(self) -> None:
+        """新建一轮会话：当前会话留在列表里，界面换成空白的一份。"""
+        if self._active_handles:
+            self.statusBar().showMessage("任务执行中，等它结束再新建会话。")
+            return
+        self._save_active_session()
+        session = Session.create()
+        self._sessions.insert(0, session)
+        # 超出上限只丢最旧的；刚建的这个在最前面，不会被丢
+        del self._sessions[MAX_SESSIONS:]
+        self._active_session_id = session.id
+        self._sync_session_list()
+        self._load_session_content(session)
+        self._session_store.save(self._sessions, self._active_session_id)
+        self.statusBar().showMessage("已新建会话")
+
+    @pyqtSlot(str)
+    def _on_delete_session(self, session_id: str) -> None:
+        """右键删除一个会话；删的是当前会话时自动切到相邻的一个。"""
+        if self._active_handles:
+            self.statusBar().showMessage("任务执行中，等它结束再删除会话。")
+            return
+        target = next((item for item in self._sessions if item.id == session_id), None)
+        if target is None:
+            return
+        if not self._confirm_delete(target):
+            return
+
+        was_active = target.id == self._active_session_id
+        index = self._sessions.index(target)
+        self._sessions.remove(target)
+
+        if not self._sessions:
+            # 至少留一个空白会话，否则界面没有可编辑的目标
+            replacement = Session.create()
+            self._sessions.append(replacement)
+            self._active_session_id = replacement.id
+            self._sync_session_list()
+            self._load_session_content(replacement)
+        elif was_active:
+            # 用原来的位置接着往后挑一个，没有就取前一个
+            neighbour = self._sessions[min(index, len(self._sessions) - 1)]
+            self._active_session_id = neighbour.id
+            self._sync_session_list()
+            self._load_session_content(neighbour)
+        else:
+            self._sync_session_list()
+
+        self._session_store.save(self._sessions, self._active_session_id)
+        self.statusBar().showMessage(f"已删除会话「{target.title}」")
+
+    def _confirm_delete(self, session: Session) -> bool:
+        """删掉就找不回来，先问一次；单独成方法方便测试替换。"""
+        answer = QMessageBox.question(
+            self,
+            "删除会话",
+            f"确定删除会话「{session.title}」吗？\n这一轮的对话记录无法恢复。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     # ---- 状态持久化 ----
     def _restore_state(self) -> None:
         geometry = self._settings.geometry
@@ -380,6 +569,8 @@ class MainWindow(QMainWindow):
             for handle in list(self._active_handles):
                 self._release_handle(handle)
 
+        # 关窗前把当前会话存下来，下次启动能接着看
+        self._save_active_session()
         self._settings.geometry = self.saveGeometry()
         self._settings.sync()
         super().closeEvent(event)
@@ -415,6 +606,8 @@ class MainWindow(QMainWindow):
 
         mark = self._chat_view.append_message("user", task)
         self._prompt_list.add_prompt(task, mark)
+        # 立刻存档：标题跟着第一条消息定下来，任务中途崩掉也不至于丢掉提问
+        self._save_active_session()
         self._files_changed = False
         self._prompt_input.clear()
         self._prompt_input.set_running(True)
@@ -476,11 +669,13 @@ class MainWindow(QMainWindow):
     def _on_run_done(self, messages: list[BaseMessage], handle) -> None:
         self._history = trim_history(list(messages))
         self._refresh_tree_if_changed()
+        self._save_active_session()
         self._finish_task("就绪")
 
     def _on_run_failed(self, message: str, handle) -> None:
         self._chat_view.append_system(f"错误：{message}")
         self._refresh_tree_if_changed()
+        self._save_active_session()
         self._finish_task("出错")
 
     def _refresh_tree_if_changed(self) -> None:
@@ -535,6 +730,13 @@ class MainWindow(QMainWindow):
         self._prompt_list.clear_prompts()
         self._prompt_input.reset_context()
         self._chat_view.clear_history()
+        # 内容清空了，标题也要跟着回到默认值
+        session = self._active_session()
+        session.title = DEFAULT_TITLE
+        session.entries = []
+        session.set_history([])
+        self._sync_session_list()
+        self._session_store.save(self._sessions, self._active_session_id)
 
     def _open_settings(self) -> None:
         dialog = SettingsDialog(self._manager, self)

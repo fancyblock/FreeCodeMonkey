@@ -44,6 +44,7 @@ class PromptInput(QWidget):
     submitted = pyqtSignal(str)
     stop_requested = pyqtSignal()
     mode_changed = pyqtSignal(str)
+    new_session_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -58,6 +59,9 @@ class PromptInput(QWidget):
         self._stop_button = QPushButton("停止")
         self._stop_button.setIcon(icon("stop", size=14))
         self._stop_button.setVisible(False)
+        self._new_session_button = QPushButton("新建会话")
+        self._new_session_button.setIcon(icon("plus", size=14))
+        self._new_session_button.setToolTip("开一段新的对话，当前会话会保留在左侧列表里")
         self._build_ui()
         self._connect_signals()
 
@@ -88,6 +92,7 @@ class PromptInput(QWidget):
         buttons = QHBoxLayout()
         buttons.addWidget(QLabel("Agent："))
         buttons.addWidget(self._mode_combo)
+        buttons.addWidget(self._new_session_button)
         buttons.addStretch(1)
         buttons.addWidget(self._context_bar)
         buttons.addWidget(self._stop_button)
@@ -100,6 +105,7 @@ class PromptInput(QWidget):
 
     def _connect_signals(self) -> None:
         self._send_button.clicked.connect(self._emit_text)
+        self._new_session_button.clicked.connect(self.new_session_requested.emit)
         self._stop_button.clicked.connect(self.stop_requested.emit)
         self._edit.submit_shortcut.connect(self._emit_text)
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
@@ -155,6 +161,8 @@ class PromptInput(QWidget):
         self._edit.setDisabled(running)
         self._send_button.setDisabled(running)
         self._mode_combo.setDisabled(running)
+        # 任务执行中不允许换会话，按钮同步置灰，避免点了没反应
+        self._new_session_button.setDisabled(running)
         self._stop_button.setVisible(running)
         if not running:
             self._edit.setFocus()

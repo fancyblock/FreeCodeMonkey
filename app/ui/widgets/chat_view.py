@@ -52,6 +52,10 @@ class ChatView(QTextBrowser):
         # 每条消息在文档里的字符区间：标记名 → (起始位置, 结束位置)
         self._marks: dict[str, tuple[int, int]] = {}
         self._seq = 0
+        # 写入过的内容记录，切换会话时据此重放
+        self._entries: list[tuple] = []
+        # 重放期间逐条滚到底很慢，先关掉，结束时统一滚一次
+        self._suppress_scroll = False
 
     # ---- 消息 ----
     def append_message(self, role: str, content: str) -> str:
@@ -90,6 +94,7 @@ class ChatView(QTextBrowser):
         name = f"msg-{self._seq}"
         self._seq += 1
         self._marks[name] = (block.position(), self.document().characterCount() - 1)
+        self._entries.append(("msg", role, content))
         self.setExtraSelections([])
         self._scroll_to_bottom()
         return name
@@ -101,6 +106,7 @@ class ChatView(QTextBrowser):
             f'<div style="margin:6px 0;color:{palette().text_faint};'
             f'font-style:italic;">{escaped}</div>'
         )
+        self._entries.append(("sys", text))
         self._scroll_to_bottom()
 
     # ---- agent 步骤 ----
@@ -119,6 +125,7 @@ class ChatView(QTextBrowser):
             )
         html.append("</div>")
         self.append("".join(html))
+        self._entries.append(("step", title, body, tone))
         self._scroll_to_bottom()
 
     def append_divider(self) -> None:
@@ -128,6 +135,7 @@ class ChatView(QTextBrowser):
             f'<p style="margin:14px 0;background-color:{palette().border};'
             'font-size:1px;line-height:1px;">&nbsp;</p>'
         )
+        self._entries.append(("div",))
         self._scroll_to_bottom()
 
     # ---- 定位 ----
@@ -160,9 +168,52 @@ class ChatView(QTextBrowser):
     def clear_history(self) -> None:
         self.clear()
         self._marks.clear()
+        self._entries.clear()
         self._seq = 0
 
+    # ---- 会话切换 ----
+    def entries(self) -> list[tuple]:
+        """当前记录，供会话切换时存档。"""
+        return list(self._entries)
+
+    def replay(self, entries: list) -> list[tuple[str, str]]:
+        """清空后按记录重放，返回 (用户提示词, 标记名) 列表。
+
+        重放会把 _seq 归零，所以同一份记录每次生成的标记名都一样，
+        提示词列表里存的标记在切回来之后仍然可用。
+        """
+        self.clear_history()
+        self._suppress_scroll = True
+        prompts: list[tuple[str, str]] = []
+        try:
+            for entry in entries:
+                if not isinstance(entry, (list, tuple)) or not entry:
+                    continue
+                kind = str(entry[0])
+                if kind == "msg" and len(entry) >= 3:
+                    role = str(entry[1])
+                    content = "" if entry[2] is None else str(entry[2])
+                    mark = self.append_message(role, content)
+                    if role == "user":
+                        prompts.append((content, mark))
+                elif kind == "sys" and len(entry) >= 2:
+                    self.append_system("" if entry[1] is None else str(entry[1]))
+                elif kind == "step" and len(entry) >= 2:
+                    body = "" if len(entry) < 3 or entry[2] is None else str(entry[2])
+                    tone = "muted" if len(entry) < 4 or entry[3] is None else str(entry[3])
+                    self.append_step(
+                        "" if entry[1] is None else str(entry[1]), body, tone
+                    )
+                elif kind == "div":
+                    self.append_divider()
+        finally:
+            self._suppress_scroll = False
+        self._scroll_to_bottom()
+        return prompts
+
     def _scroll_to_bottom(self) -> None:
+        if self._suppress_scroll:
+            return
         cursor = self.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.setTextCursor(cursor)

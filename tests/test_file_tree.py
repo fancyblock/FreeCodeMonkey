@@ -24,6 +24,7 @@ from app.core import ProviderManager
 from app.ui import MainWindow
 from app.ui.dialogs import FilePreviewDialog
 from app.ui.dialogs.file_preview_dialog import MAX_PREVIEW_LINES, read_preview
+from app.ui.sessions import SessionStore
 from app.ui.widgets import FileTree
 from app.ui.widgets.file_tree import MAX_TREE_ENTRIES
 
@@ -278,7 +279,9 @@ class MainWindowFileTreeTest(unittest.TestCase):
             QSettings(str(self.root / "s.ini"), QSettings.Format.IniFormat)
         )
         settings.workspace_root = str(self.root)
-        self.window = MainWindow(settings, ProviderManager(settings))
+        # 会话存到临时目录，别去碰真实用户数据
+        store = SessionStore(self.root / "sessions.json")
+        self.window = MainWindow(settings, ProviderManager(settings), store)
 
     def tearDown(self) -> None:
         import app.ui.main_window as window_module
@@ -291,8 +294,10 @@ class MainWindowFileTreeTest(unittest.TestCase):
         self.assertEqual(
             self.window._left_splitter.orientation(), Qt.Orientation.Vertical
         )
+        # 从上到下：文件树 / 会话 / 提示词
         self.assertIs(self.window._left_splitter.widget(0), self.window._file_tree)
-        self.assertIs(self.window._left_splitter.widget(1), self.window._prompt_list)
+        self.assertIs(self.window._left_splitter.widget(1), self.window._session_list)
+        self.assertIs(self.window._left_splitter.widget(2), self.window._prompt_list)
         self.assertIs(
             self.window._body_splitter.widget(0), self.window._left_splitter
         )

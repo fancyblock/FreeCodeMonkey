@@ -24,6 +24,7 @@ from app.agent import ApprovalDecision
 from app.config import Settings
 from app.core import ProviderConfig, ProviderManager, ProviderStore
 from app.ui import MainWindow
+from app.ui.sessions import SessionStore
 from test_agent_loop import ScriptedChatModel, tool_call
 
 ALLOWED = {"value": True}
@@ -78,7 +79,8 @@ class EndToEndTest(unittest.TestCase):
 
         manager = ProviderManager(settings)
         manager.build_model = lambda cfg: model  # 跳过真实 provider
-        window = MainWindow(settings, manager)
+        store = SessionStore(self.root / "sessions.json")
+        window = MainWindow(settings, manager, store)
         window.show()
         return window
 
