@@ -51,6 +51,8 @@ app/
     ├── agent_bridge.py          跨线程审批通道（工作线程 ↔ 界面线程）
     ├── theme.py                 ★ 样式层：语义色令牌 + 字体 + 全局 QSS
     ├── icons.py                 内联 SVG 图标（颜色跟随令牌，无需资源文件）
+    ├── branding.py              应用图标（窗口 / 任务栏）
+    ├── assets/                  app_icon.ico（多尺寸）与 app_icon.png
     ├── widgets/                 对话视图（含步骤流）、文件树、提示词列表、输入区
     └── dialogs/                 Provider 设置、危险操作确认、文件预览
 ```
@@ -68,6 +70,18 @@ app/
 
 要加暗色主题，只需在 `theme.py` 里补一个 `Palette` 实例并调用 `apply_theme(app, 新色板)`；
 注意已渲染进对话区的 HTML 不会自动变色，需要按记录重放。
+
+#### 应用图标
+
+窗口与任务栏图标由 `app/ui/assets/app_icon.ico` 提供，在 `main.py` 里用
+`app.setWindowIcon(...)` 挂在应用级，窗口和对话框都自动继承。ICO 内包含
+16/20/24/32/40/48/64/128/256 九种尺寸，Windows 会按当前缩放比例挑选，
+不需要运行时缩放。
+
+仓库根目录的 `icon.png` 是图标源图。当前这份 `assets/` 由它处理后得到：
+去掉了右下角的生成水印，并按拟合出的圆角半径重建了该处轮廓。以后要换图标，
+替换源图后重新导出这两种文件即可。将来用 PyInstaller 打包时，把
+`app/ui/assets/app_icon.ico` 传给 `--icon` 就能让 exe 也用同一个图标。
 
 关键边界：`app/agent` 里没有一行 Qt 代码。循环只依赖两个注入项——事件回调与审批通道。
 界面负责把事件画出来、把审批弹出来，其余都在 agent 侧，因此可以脱离 GUI 直接测试。
