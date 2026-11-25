@@ -25,20 +25,32 @@ from app.core import ProviderConfig, ProviderManager, ProviderStore
 from app.ui import MainWindow
 from app.ui.sessions import (
     DEFAULT_TITLE,
+    SAVED_FALLBACK,
+    SAVED_PRIMARY,
+    STORE_FILE_NAME,
     Session,
     SessionStore,
-    default_store_path,
     guess_workspace,
     make_title,
+    migrate_legacy_sessions,
     same_workspace,
+    workspace_store_path,
 )
 from app.ui.widgets import ChatView, SessionList
 
 
 class SessionStoreTest(unittest.TestCase):
+    """store 绑在一个工作区上，文件就在那个目录的隐藏目录里。"""
+
+    def make_store(self, root: Path, **kwargs) -> SessionStore:
+        # 旧文件与回退位置都指到临时目录里，测试之间互不影响
+        kwargs.setdefault("legacy_path", root / "legacy.json")
+        kwargs.setdefault("fallback_path", root / "fallback.json")
+        return SessionStore(root, **kwargs)
+
     def test_roundtrip_keeps_entries_and_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = SessionStore(Path(tmp) / "sessions.json")
+            store = self.make_store(Path(tmp))
             session = Session.create(now=1000.0)
             session.title = "改个 bug"
             session.entries = [
@@ -65,14 +77,28 @@ class SessionStoreTest(unittest.TestCase):
 
     def test_missing_file_returns_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = SessionStore(Path(tmp) / "nope.json")
+            store = self.make_store(Path(tmp))
+            self.assertFalse(store.exists())
             self.assertEqual(store.load(), ([], ""))
+
+    def test_store_lives_inside_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            store = self.make_store(root)
+            self.assertEqual(store.path, workspace_store_path(root))
+            self.assertEqual(store.path, root / ".free-code-monkey" / STORE_FILE_NAME)
+
+            session = Session.create(now=1.0)
+            self.assertEqual(store.save([session], session.id), SAVED_PRIMARY)
+            self.assertTrue(store.exists())
+            self.assertTrue(store.path.is_file())
 
     def test_corrupt_json_returns_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "sessions.json"
-            path.write_text("{ this is not json", encoding="utf-8")
-            store = SessionStore(path)
+            root = Path(tmp)
+            store = self.make_store(root)
+            store.path.parent.mkdir(parents=True)
+            store.path.write_text("{ this is not json", encoding="utf-8")
             self.assertEqual(store.load(), ([], ""))
             # 坏文件不应该让之后的保存失败
             session = Session.create(now=1.0)
@@ -83,35 +109,185 @@ class SessionStoreTest(unittest.TestCase):
 
     def test_bad_session_entries_are_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "sessions.json"
+            store = self.make_store(Path(tmp))
             good = Session.create(now=2.0)
             payload = {
                 "version": 1,
                 "active": good.id,
                 "sessions": [good.to_dict(), {"no_id": True}, "junk", None],
             }
-            path.write_text(json.dumps(payload), encoding="utf-8")
-            sessions, active = SessionStore(path).load()
+            store.path.parent.mkdir(parents=True)
+            store.path.write_text(json.dumps(payload), encoding="utf-8")
+            sessions, active = store.load()
             self.assertEqual(len(sessions), 1)
             self.assertEqual(sessions[0].id, good.id)
             self.assertEqual(active, good.id)
 
     def test_sessions_sorted_newest_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = SessionStore(Path(tmp) / "sessions.json")
+            store = self.make_store(Path(tmp))
             older = Session.create(now=100.0)
             newer = Session.create(now=200.0)
             store.save([older, newer], newer.id)
             sessions, _ = store.load()
             self.assertEqual([s.id for s in sessions], [newer.id, older.id])
 
+    def test_save_stamps_sessions_with_workspace(self) -> None:
+        """会话在文件之间搬动之后，归属字段要跟着文件走。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            store = self.make_store(root)
+            session = Session.create(now=1.0, workspace="C:/somewhere/else")
+            store.save([session], session.id)
+
+            sessions, _ = store.load()
+            self.assertTrue(same_workspace(sessions[0].workspace, root))
+
+    def test_unwritable_workspace_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            fallback = root / "fallback.json"
+            store = SessionStore(root, fallback_path=fallback, legacy_path=root / "l.json")
+            session = Session.create(now=1.0)
+
+            # 把「工作区里的存储目录」占成一个同名文件，写入必然失败
+            store.path.parent.write_text("不是目录", encoding="utf-8")
+
+            self.assertEqual(store.save([session], session.id), SAVED_FALLBACK)
+            self.assertTrue(fallback.is_file())
+            sessions, active = store.load()
+            self.assertEqual([s.id for s in sessions], [session.id])
+            self.assertEqual(active, session.id)
+
+    def test_both_locations_are_merged_by_id(self) -> None:
+        """曾不可写、后来可写：两处的会话都要在，同一轮不能出现两次。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            fallback = root / "fallback.json"
+            store = SessionStore(root, fallback_path=fallback, legacy_path=root / "l.json")
+
+            shared = Session.create(now=300.0)
+            only_fallback = Session.create(now=200.0)
+            only_primary = Session.create(now=100.0)
+            store.path.parent.mkdir(parents=True)
+            store.path.write_text(
+                json.dumps(
+                    {
+                        "version": 3,
+                        "active": only_primary.id,
+                        "sessions": [shared.to_dict(), only_primary.to_dict()],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fallback.write_text(
+                json.dumps(
+                    {
+                        "version": 3,
+                        "active": only_fallback.id,
+                        "sessions": [shared.to_dict(), only_fallback.to_dict()],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            sessions, active = store.load()
+            ids = [s.id for s in sessions]
+            self.assertEqual(len(ids), len(set(ids)))  # 去重
+            self.assertEqual(
+                set(ids), {shared.id, only_primary.id, only_fallback.id}
+            )
+            self.assertEqual(active, only_primary.id)
+
+
+class MigrateLegacyTest(unittest.TestCase):
+    """旧版全局单文件 → 按工作区存放。"""
+
+    def write_legacy(self, path: Path, sessions: list[Session], active: str = "") -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "active": active,
+                    "sessions": [s.to_dict() for s in sessions],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    def test_only_sessions_of_this_workspace_are_claimed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            other = root / "other-project"
+            other.mkdir()
+            mine = Session.create(now=2.0, workspace=str(root))
+            theirs = Session.create(now=1.0, workspace=str(other))
+            legacy = root / "legacy.json"
+            self.write_legacy(legacy, [mine, theirs])
+
+            claimed = migrate_legacy_sessions(root, [str(root)], legacy)
+
+            self.assertEqual([s.id for s in claimed], [mine.id])
+
+    def test_sessions_without_workspace_are_guessed_by_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            here = root / "here"
+            (here / "src").mkdir(parents=True)
+            (here / "src" / "app.py").write_text("x\n", encoding="utf-8")
+            legacy = root / "legacy.json"
+
+            matched = Session.create(now=2.0, workspace="")
+            matched.entries = [
+                ("msg", "user", "看看"),
+                ("step", "▸ read_file  src/app.py", "", "ok"),
+            ]
+            unknown = Session.create(now=1.0, workspace="")
+            unknown.entries = [("msg", "user", "你好")]
+            self.write_legacy(legacy, [matched, unknown])
+
+            # 内容里有 here 下真实存在的文件，无线索的那条归当前工作区
+            claimed = migrate_legacy_sessions(here, [str(here)], legacy)
+            self.assertEqual({s.id for s in claimed}, {matched.id, unknown.id})
+
+    def test_missing_legacy_file_claims_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            self.assertEqual(
+                migrate_legacy_sessions(root, [str(root)], root / "nope.json"), []
+            )
+
+    def test_workspace_file_is_created_on_first_open(self) -> None:
+        """认领之后要落到本工作区的文件里，旧文件保持原样。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            legacy = root / "legacy.json"
+            mine = Session.create(now=1.0, workspace=str(root))
+            self.write_legacy(legacy, [mine])
+            before = legacy.read_text(encoding="utf-8")
+
+            store = SessionStore(root, legacy_path=legacy, fallback_path=root / "fb.json")
+            claimed = migrate_legacy_sessions(root, [str(root)], store.legacy_path)
+            store.save(claimed, mine.id)
+
+            self.assertTrue(store.exists())
+            sessions, active = store.load()
+            self.assertEqual([s.id for s in sessions], [mine.id])
+            self.assertEqual(active, mine.id)
+            # 旧文件只读，一个字节都不该变
+            self.assertEqual(legacy.read_text(encoding="utf-8"), before)
+
     def test_broken_history_does_not_raise(self) -> None:
         session = Session.create()
         session.messages = [{"type": "human", "data": "不是合法结构"}]
         self.assertEqual(session.history(), [])
 
-    def test_default_store_path_is_absolute(self) -> None:
-        self.assertTrue(default_store_path().is_absolute())
+    def test_workspace_store_path_follows_root(self) -> None:
+        self.assertTrue(workspace_store_path("C:/some/project").is_absolute())
+        self.assertTrue(workspace_store_path("C:/some/project").is_relative_to(
+            Path("C:/some/project")
+        ))
 
     def test_make_title_truncates_and_collapses(self) -> None:
         self.assertEqual(make_title("  多   个 空格\n换行  "), "多 个 空格 换行")
@@ -378,10 +554,23 @@ class SessionWindowTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
-        self.store_path = self.root / "sessions.json"
+        # 旧版全局文件放在临时目录里：迁移相关用例往这儿写，绝不动真实 AppData
+        self.legacy_path = self.root / "legacy.json"
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
+
+    def store_for(self, root: Path) -> SessionStore:
+        return SessionStore(
+            root,
+            legacy_path=self.legacy_path,
+            fallback_path=self.root / "fallback" / f"{root.name}.json",
+            # 台账也要隔离：否则会写进真实的 AppData
+            ledger_path=self.root / "legacy_claims.json",
+        )
+
+    def store_path(self, root: Path) -> Path:
+        return workspace_store_path(root)
 
     def make_window(
         self, workspace: Path | None = None, history: list[Path] | None = None
@@ -401,7 +590,7 @@ class SessionWindowTest(unittest.TestCase):
         settings.providers_json = ProviderStore.dumps([config])
         settings.active_provider_id = "p1"
         return MainWindow(
-            settings, ProviderManager(settings), SessionStore(self.store_path)
+            settings, ProviderManager(settings), self.store_for
         )
 
     def test_starts_with_one_session(self) -> None:
@@ -521,31 +710,25 @@ class SessionWindowTest(unittest.TestCase):
         window.close()
 
     def test_session_cap_is_per_workspace(self) -> None:
+        """上限按工作区各算各的：一个工作区存满，不影响另一个。"""
         from app.constants import MAX_SESSIONS
 
-        window = self.make_window()
-        workspace = str(window._workspace_root)
         other = self.root / "other-project"
         other.mkdir()
-        # 另一个工作区也存满会话；当前工作区新建时不该动它们的
-        window._sessions = [
-            Session.create(now=float(i), workspace=str(other.resolve()))
-            for i in range(MAX_SESSIONS)
-        ]
-        window._sessions.append(
-            Session.create(now=900.0, workspace=workspace)
+        # 另一个工作区先自行存满，它有自己的文件
+        other_store = self.store_for(other.resolve())
+        other_store.save(
+            [Session.create(now=float(i)) for i in range(MAX_SESSIONS)],
+            "",
         )
-        window._active_session_id = window._sessions[-1].id
 
-        window._on_new_session()
+        window = self.make_window()
+        for _ in range(MAX_SESSIONS):
+            window._on_new_session()
 
-        self.assertEqual(
-            len(window._workspace_sessions()), 2
-        )  # 原来那轮 + 新建的
-        self.assertEqual(
-            len([s for s in window._sessions if s.workspace == str(other.resolve())]),
-            MAX_SESSIONS,
-        )
+        # 当前工作区自己封顶；另一个工作区原样不动
+        self.assertEqual(len(window._sessions), MAX_SESSIONS)
+        self.assertEqual(len(other_store.load()[0]), MAX_SESSIONS)
         window.close()
 
     def test_switch_workspace_swaps_sessions_and_chat(self) -> None:
@@ -578,8 +761,14 @@ class SessionWindowTest(unittest.TestCase):
         self.assertEqual(window._prompt_list.count(), 1)
         self.assertIn("A 里的提问", window._chat_view.toPlainText())
         self.assertNotIn("B 里的提问", window._chat_view.toPlainText())
-        # 两轮的会话都还在，只是各归各的工作区
-        self.assertEqual({s.id for s in window._sessions}, {a_session_id, b_session_id})
+        # 两轮各自存在自己的工作区文件里
+        a_sessions, a_active = self.store_for(self.root.resolve()).load()
+        b_sessions, b_active = self.store_for(other.resolve()).load()
+        self.assertEqual([s.id for s in a_sessions], [a_session_id])
+        self.assertEqual([s.id for s in b_sessions], [b_session_id])
+        # active 也各记各的，不再被互相覆盖
+        self.assertEqual(a_active, a_session_id)
+        self.assertEqual(b_active, b_session_id)
         window.close()
 
     def test_workspace_sessions_persist_across_restart(self) -> None:
@@ -610,8 +799,8 @@ class SessionWindowTest(unittest.TestCase):
         back.close()
 
     def _write_legacy_store(self, sessions: list[dict], active: str = "") -> None:
-        """写一份老格式（version 1、会话里没有 workspace）的会话文件。"""
-        self.store_path.write_text(
+        """写一份老格式（version 1、会话里没有 workspace）的全局会话文件。"""
+        self.legacy_path.write_text(
             json.dumps(
                 {"version": 1, "active": active, "sessions": sessions},
                 ensure_ascii=False,
@@ -632,15 +821,33 @@ class SessionWindowTest(unittest.TestCase):
         self.assertEqual(window._active_session_id, legacy.id)
         window.close()
 
+    def test_migration_writes_into_workspace_not_legacy(self) -> None:
+        """认领后写进工作区自己的文件，旧全局文件保持原样。"""
+        mine = Session.create(now=1.0, workspace=str(self.root.resolve()))
+        self._write_legacy_store([mine.to_dict()], mine.id)
+        before = self.legacy_path.read_text(encoding="utf-8")
+
+        window = self.make_window()
+        window.close()
+
+        stored = self.store_path(self.root.resolve())
+        self.assertTrue(stored.is_file())
+        payload = json.loads(stored.read_text(encoding="utf-8"))
+        self.assertEqual(payload["version"], SessionStore.VERSION)
+        self.assertEqual([s["id"] for s in payload["sessions"]], [mine.id])
+        # 迁移只读旧文件
+        self.assertEqual(self.legacy_path.read_text(encoding="utf-8"), before)
+
     def test_session_missing_workspace_is_not_hidden(self) -> None:
-        """新格式文件里个别会话缺归属时，也要落到当前工作区，不能看不见。"""
+        """文件里的会话缺归属时，按「文件在哪」补齐，不能看不见。"""
         orphan = Session.create(now=1.0)
         orphan.entries = [("msg", "user", "别让我消失")]
-        SessionStore(self.store_path).save([orphan], orphan.id)
+        store = self.store_for(self.root.resolve())
+        store.save([orphan], orphan.id)
         # 模拟把字段写丢
-        payload = json.loads(self.store_path.read_text(encoding="utf-8"))
+        payload = json.loads(store.path.read_text(encoding="utf-8"))
         payload["sessions"][0].pop("workspace", None)
-        self.store_path.write_text(
+        store.path.write_text(
             json.dumps(payload, ensure_ascii=False), encoding="utf-8"
         )
 
@@ -651,7 +858,7 @@ class SessionWindowTest(unittest.TestCase):
         window.close()
 
     def test_legacy_sessions_are_split_by_content(self) -> None:
-        """旧数据里混着几个项目的会话：按内容各回各家，不能全归当前工作区。"""
+        """旧数据里混着几个项目的会话：各回各家，不能全归当前工作区。"""
         here = self.root.resolve()
         # 另一个项目：有一个真实存在的文件，会话里提到它
         other = self.root / "unity-project"
@@ -673,33 +880,27 @@ class SessionWindowTest(unittest.TestCase):
         # 另一个项目在历史目录里，推断时才会被当成候选
         window = self.make_window(history=[other])
 
-        by_id = {s.id: s for s in window._sessions}
-        self.assertTrue(same_workspace(by_id[mine.id].workspace, self.root))
-        self.assertTrue(same_workspace(by_id[theirs.id].workspace, other))
-        # 当前工作区只看得到自己的那一轮
+        # 当前工作区只认领自己的那一轮
         self.assertEqual([s.id for s in window._workspace_sessions()], [mine.id])
+        self.assertEqual([s.id for s in window._sessions], [mine.id])
         window.close()
 
-    def test_migrated_workspace_is_persisted(self) -> None:
-        """推断结果要落盘：下次启动不能再按陈旧数据重算。"""
-        other = self.root / "unity-project"
-        (other / "Assets").mkdir(parents=True)
-        (other / "Assets" / "Hud.cs").write_text("x\n", encoding="utf-8")
-        theirs = Session.create(now=1.0)
-        theirs.entries = [("step", "▸ read_file  Assets/Hud.cs", "", "ok")]
-        data = theirs.to_dict() | {"workspace": ""}
-        self._write_legacy_store([data], theirs.id)
+        # 打开另一个项目时，它才认领属于自己的那轮
+        theirs_window = self.make_window(other.resolve(), history=[here])
+        self.assertEqual([s.id for s in theirs_window._sessions], [theirs.id])
+        theirs_window.close()
 
-        window = self.make_window(history=[other])
-        window.close()
+    def test_migration_runs_only_once(self) -> None:
+        """再次启动时不再重跑迁移：工作区文件已存在就直接读它。"""
+        mine = Session.create(now=1.0, workspace=str(self.root.resolve()))
+        self._write_legacy_store([mine.to_dict()], mine.id)
+        self.make_window().close()
 
-        sessions, _active = SessionStore(self.store_path).load()
-        saved = next((s for s in sessions if s.id == theirs.id), None)
-        self.assertIsNotNone(saved)
-        self.assertEqual(str(Path(saved.workspace).resolve()), str(other.resolve()))
-        # 文件已升级到新版本，旧数据不会再被当成「待迁移」
-        payload = json.loads(self.store_path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], SessionStore.VERSION)
+        # 迁移之后把旧文件换成完全不同的内容，重启不该再受影响
+        self._write_legacy_store([], "")
+        reopened = self.make_window()
+        self.assertEqual([s.id for s in reopened._sessions], [mine.id])
+        reopened.close()
 
     def test_switch_workspace_does_not_write_into_session(self) -> None:
         """切换工作区只更新状态栏，不能往新工作区的会话里塞记录。"""
@@ -728,13 +929,20 @@ class SessionWindowTest(unittest.TestCase):
 
         window._on_move_session(moved_id, str(other.resolve()))
 
-        by_id = {s.id: s for s in window._sessions}
-        self.assertTrue(same_workspace(by_id[moved_id].workspace, other))
         # 当前工作区自动换成了另一轮空白会话，列表里也不再出现它
         self.assertNotEqual(window._active_session_id, moved_id)
         self.assertEqual(window._session_list.count(), 1)
         self.assertNotIn(moved_id, {s.id for s in window._workspace_sessions()})
         self.assertEqual(window._chat_view.toPlainText(), "")
+
+        # 它已经写进目标工作区自己的文件，归属也跟着变成那个目录
+        moved_sessions, _active = self.store_for(other.resolve()).load()
+        self.assertEqual([s.id for s in moved_sessions], [moved_id])
+        self.assertTrue(same_workspace(moved_sessions[0].workspace, other))
+        self.assertEqual(
+            [s.id for s in self.store_for(self.root.resolve()).load()[0]],
+            [window._active_session_id],
+        )
         window.close()
 
     def test_move_blocked_while_running(self) -> None:

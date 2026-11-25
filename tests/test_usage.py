@@ -30,7 +30,8 @@ from app.agent.usage import (
 from app.config import Settings
 from app.core import ProviderConfig, ProviderManager, ProviderStore
 from app.ui import MainWindow
-from app.ui.sessions import Session, SessionStore
+from app.ui.sessions import Session
+from store_support import workspace_store_factory
 from app.ui.widgets import PromptInput
 from test_agent_loop import AllowAll, ScriptedChatModel, tool_call
 
@@ -266,7 +267,7 @@ class SessionUsagePersistenceTest(unittest.TestCase):
         settings.providers_json = ProviderStore.dumps([config])
         settings.active_provider_id = "p1"
         return MainWindow(
-            settings, ProviderManager(settings), SessionStore(self.root / "s.json")
+            settings, ProviderManager(settings), workspace_store_factory(self.root)
         )
 
     def test_round_usage_accumulates_into_session(self) -> None:

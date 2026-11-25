@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Callable
 
 from langchain_core.messages import BaseMessage
 from PyQt6.QtCore import Qt, pyqtSlot
@@ -57,10 +58,12 @@ from app.ui.export import (
 from app.ui.icons import icon
 from app.ui.sessions import (
     DEFAULT_TITLE,
+    SAVED_FALLBACK,
+    SAVE_FAILED,
     Session,
     SessionStore,
-    guess_workspace,
     make_title,
+    migrate_legacy_sessions,
     same_workspace,
 )
 from app.ui.widgets import (
@@ -86,13 +89,13 @@ class MainWindow(QMainWindow):
         self,
         settings: Settings,
         manager: ProviderManager,
-        session_store: SessionStore | None = None,
+        store_factory: Callable[[Path], SessionStore] | None = None,
     ) -> None:
         super().__init__()
         self._settings = settings
         self._manager = manager
-        # 测试与多实例场景可以注入自己的存储位置
-        self._session_store = session_store or SessionStore()
+        # 会话按工作区存放：切工作区就要换一个 store，所以注入的是工厂而不是实例
+        self._store_factory = store_factory or (lambda root: SessionStore(root))
         self._sessions: list[Session] = []
         self._active_session_id = ""
         # 保持任务句柄的引用，防止被垃圾回收导致线程提前销毁
@@ -103,6 +106,10 @@ class MainWindow(QMainWindow):
         self._bridge: AgentBridge | None = None
         self._workspace_root = self._initial_workspace()
         self._workspace_history = self._load_workspace_history()
+        # 当前工作区的会话存储；切工作区时跟着换
+        self._session_store = self._store_factory(self._workspace_root)
+        # 存不进工作区时只提示一次，别每条消息都跳出来
+        self._store_notice_shown = False
         # 本次任务是否改过文件；任务结束时决定要不要刷新文件树
         self._files_changed = False
         # 确认卡出现前的上下分栏比例，确认完按原样还回去
@@ -409,8 +416,11 @@ class MainWindow(QMainWindow):
         self._sync_workspace_combo()
         self._file_tree.set_root(root)
         self._files_changed = False
-        self._activate_workspace_session()
-        self._session_store.save(self._sessions, self._active_session_id)
+        # 换工作区就换存储：会话文件在那个目录里，跟当前工作区一一对应
+        self._session_store = self._store_factory(root)
+        self._store_notice_shown = False
+        # 进入时不写盘：目标工作区的 active 在它上次被切走时就存过了
+        self._load_workspace_sessions()
         # 只写在状态栏：对话区现在装的是这个工作区自己的会话，别往里塞无关记录
         self.statusBar().showMessage(f"工作区已切换到 {root}")
 
@@ -421,35 +431,53 @@ class MainWindow(QMainWindow):
 
     # ---- 会话 ----
     def _restore_sessions(self) -> None:
-        """启动时读出会话列表，并铺开当前工作区上次用的那一轮。"""
-        sessions, active_id = self._session_store.load()
-        self._sessions = sessions
-        # 旧版本不分工作区；新版本里也可能有个别会话缺归属（数据被改坏之类）
-        reconsider_all = self._session_store.loaded_version < SessionStore.VERSION
-        fixable = reconsider_all or any(not s.workspace for s in sessions)
-        if fixable:
-            self._reassign_workspaces(reconsider_all)
-        self._activate_workspace_session(active_id)
-        if fixable:
-            # 修正结果马上落盘，下次启动不用再推断
-            self._session_store.save(self._sessions, self._active_session_id)
+        """启动时读出当前工作区的会话，并铺开上次用的那一轮。"""
+        self._load_workspace_sessions()
 
-    def _reassign_workspaces(self, reconsider_all: bool = False) -> None:
-        """给会话补上「属于哪个工作区」。
+    def _workspace_candidates(self) -> list[str]:
+        """反推旧会话归属时的候选目录：当前工作区优先，其次是用过的目录。"""
+        return [str(self._workspace_root), *self._workspace_history]
 
-        旧版本把所有会话存在一起、不记目录，只能按内容反推：记录里出现过
-        某个目录的路径或名字，或者提到的文件确实长在那个目录下。
-        ``reconsider_all=False`` 时只处理缺归属的那些，不推翻已有结论。
-        推断不出又完全没有归属的，归到当前工作区，至少不会丢。
+    def _load_workspace_sessions(self, prefer_id: str = "") -> None:
+        """读当前工作区的会话文件，首次打开时认领旧全局文件里的会话。
+
+        ``prefer_id`` 是「想激活哪一轮」；不传就用文件里记的 active。
         """
-        candidates = [str(self._workspace_root), *self._workspace_history]
-        for session in self._sessions:
-            if session.workspace and not reconsider_all:
-                continue
-            guessed = guess_workspace(session.entries, candidates)
-            session.workspace = (
-                guessed or session.workspace or str(self._workspace_root)
+        store = self._session_store
+        first_open = not store.exists()
+        migrated = 0
+        if first_open:
+            claimed = migrate_legacy_sessions(
+                self._workspace_root,
+                self._workspace_candidates(),
+                store.legacy_path,
+                store.ledger_path,
             )
+            if claimed:
+                store.save(claimed, "")
+                migrated = len(claimed)
+
+        sessions, active_id = store.load()
+        self._sessions = sessions
+        self._activate_workspace_session(prefer_id or active_id)
+        if migrated:
+            # 只有真的认领到东西才写盘：空着手打开一个工作区不该凭空多出文件
+            self._save_store()
+            self.statusBar().showMessage(
+                f"已从旧会话文件迁移 {migrated} 轮会话到 {self._workspace_root}"
+            )
+
+    def _save_store(self) -> None:
+        """把当前的会话列表写回本工作区，并在写不进时提醒一次。"""
+        result = self._session_store.save(self._sessions, self._active_session_id)
+        if result == SAVED_FALLBACK and not self._store_notice_shown:
+            self._store_notice_shown = True
+            self.statusBar().showMessage(
+                f"该目录不可写，会话已存到 {self._session_store.fallback_path.parent}"
+            )
+        elif result == SAVE_FAILED and not self._store_notice_shown:
+            self._store_notice_shown = True
+            self.statusBar().showMessage("会话无法保存：工作区与应用数据目录都写不进去")
 
     def _workspace_sessions(self) -> list[Session]:
         """当前工作区的会话，顺序与列表一致（新的在前）。"""
@@ -544,16 +572,35 @@ class MainWindow(QMainWindow):
         )
         if target is None or same_workspace(target.workspace, workspace):
             return
+        if not Path(workspace).is_dir():
+            # 历史里可能留着已经删掉的目录；别为它凭空造出隐藏目录
+            self.statusBar().showMessage(f"目标目录不存在，无法移动：{workspace}")
+            return
 
         # 先把界面上的内容存回会话，移动的是最新的一份
         self._save_active_session()
         was_active = target.id == self._active_session_id
         target.workspace = workspace
+
+        # 先写目标工作区的文件，再从当前工作区摘掉：中间出错也不会丢这一轮
+        other_store = self._store_factory(Path(workspace))
+        other_sessions, other_active = other_store.load()
+        if not any(item.id == target.id for item in other_sessions):
+            other_sessions.append(target)
+        result = other_store.save(other_sessions, other_active or target.id)
+
+        self._sessions = [item for item in self._sessions if item.id != target.id]
         if was_active:
             self._activate_workspace_session()
         else:
             self._sync_session_list()
-        self._session_store.save(self._sessions, self._active_session_id)
+        self._save_store()
+
+        if result == SAVE_FAILED:
+            self.statusBar().showMessage(
+                f"会话「{target.title}」已从当前工作区移除，但没能写入 {workspace}"
+            )
+            return
         self.statusBar().showMessage(f"已把会话「{target.title}」移到 {workspace}")
 
     def _load_session_content(self, session: Session) -> None:
@@ -586,7 +633,7 @@ class MainWindow(QMainWindow):
         if touch:
             session.updated_at = time.time()
         titled = self._refresh_title(session)
-        self._session_store.save(self._sessions, self._active_session_id)
+        self._save_store()
         if titled:
             self._sync_session_list()
 
@@ -614,7 +661,7 @@ class MainWindow(QMainWindow):
         self._save_active_session()
         self._active_session_id = session.id
         self._load_session_content(session)
-        self._session_store.save(self._sessions, self._active_session_id)
+        self._save_store()
 
     @pyqtSlot(str)
     def _on_session_activated(self, session_id: str) -> None:
@@ -629,7 +676,8 @@ class MainWindow(QMainWindow):
             (item for item in self._sessions if item.id == session_id), None
         )
         if target is None:
-            self._restore_sessions()
+            # 列表与内存对不上（数据被外部改坏）：重读一遍当前工作区
+            self._load_workspace_sessions()
             return
         if not same_workspace(target.workspace, self._workspace_root):
             # 列表只展示当前工作区的会话，别的工作区的不该被切进来
@@ -652,7 +700,7 @@ class MainWindow(QMainWindow):
         self._active_session_id = session.id
         self._sync_session_list()
         self._load_session_content(session)
-        self._session_store.save(self._sessions, self._active_session_id)
+        self._save_store()
         self.statusBar().showMessage("已新建会话")
 
     @pyqtSlot(str)
@@ -690,7 +738,7 @@ class MainWindow(QMainWindow):
         else:
             self._sync_session_list()
 
-        self._session_store.save(self._sessions, self._active_session_id)
+        self._save_store()
         self.statusBar().showMessage(f"已删除会话「{target.title}」")
 
     # ---- 导出 ----
@@ -1079,7 +1127,7 @@ class MainWindow(QMainWindow):
         session.last_tokens_in = session.last_tokens_out = 0
         self._prompt_input.set_token_usage(0, 0, session_in=0, session_out=0)
         self._sync_session_list()
-        self._session_store.save(self._sessions, self._active_session_id)
+        self._save_store()
 
     def _open_settings(self) -> None:
         dialog = SettingsDialog(self._manager, self)

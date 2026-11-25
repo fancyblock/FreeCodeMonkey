@@ -29,7 +29,8 @@ from app.ui.export import (
     sessions_to_markdown,
     write_markdown,
 )
-from app.ui.sessions import DEFAULT_TITLE, Session, SessionStore
+from app.ui.sessions import DEFAULT_TITLE, Session
+from store_support import workspace_store_factory
 
 
 def make_session(title: str, entries: list, created: float = 1700000000.0) -> Session:
@@ -192,7 +193,7 @@ class ExportButtonsTest(unittest.TestCase):
         settings.providers_json = ProviderStore.dumps([config])
         settings.active_provider_id = "p1"
         self.window = MainWindow(
-            settings, ProviderManager(settings), SessionStore(self.root / "s.json")
+            settings, ProviderManager(settings), workspace_store_factory(self.root)
         )
         self.info_messages: list[str] = []
 

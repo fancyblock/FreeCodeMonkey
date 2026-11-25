@@ -22,7 +22,7 @@ from app.agent import ApprovalRequest
 from app.config import Settings
 from app.core import ProviderConfig, ProviderManager, ProviderStore
 from app.ui import MainWindow, attention, sound
-from app.ui.sessions import SessionStore
+from store_support import workspace_store_factory
 
 
 class FakeWindow:
@@ -133,7 +133,7 @@ class MainWindowAttentionTest(unittest.TestCase):
         settings.providers_json = ProviderStore.dumps([config])
         settings.active_provider_id = "p1"
         self.window = MainWindow(
-            settings, ProviderManager(settings), SessionStore(root / "s.json")
+            settings, ProviderManager(settings), workspace_store_factory(root)
         )
 
     def tearDown(self) -> None:

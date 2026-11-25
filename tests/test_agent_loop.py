@@ -344,6 +344,31 @@ class AgentLoopTest(unittest.TestCase):
         self.assertIn("src/", tool_messages[0].content)
         self.assertNotIn("__pycache__", tool_messages[0].content)
 
+    def test_session_store_is_invisible_to_tools(self) -> None:
+        """会话文件放在工作区里，但模型既列不到它也搜不到它。"""
+        from app.constants import STORE_DIR_NAME
+
+        store_dir = self.root / STORE_DIR_NAME
+        store_dir.mkdir()
+        (store_dir / "sessions.json").write_text(
+            '{"sessions": ["机密提问 SENTINEL_12345"]}', encoding="utf-8"
+        )
+
+        _, listed = self.run_agent(
+            [tool_call("list_dir", {"depth": 2}, "c1"), AIMessage(content="ok")]
+        )
+        listed_text = [m for m in listed if isinstance(m, ToolMessage)][0].content
+        self.assertNotIn(STORE_DIR_NAME, listed_text)
+
+        _, grepped = self.run_agent(
+            [
+                tool_call("grep", {"pattern": "SENTINEL_12345"}, "c1"),
+                AIMessage(content="ok"),
+            ]
+        )
+        grep_text = [m for m in grepped if isinstance(m, ToolMessage)][0].content
+        self.assertIn("未找到匹配", grep_text)
+
     # ---- 边界 ----
     def test_path_escape_is_rejected(self) -> None:
         _, result = self.run_agent(

@@ -72,6 +72,28 @@ class SnapshotTest(unittest.TestCase):
         self.assertNotIn("node_modules/pkg/index.js", after)
         self.assertEqual(changed_files(before, after), [])
 
+    def test_session_store_dir_is_not_counted_as_a_change(self) -> None:
+        """会话文件就在工作区里，但它写盘不能算成「本轮改了文件」。"""
+        from app.constants import STORE_DIR_NAME
+        from app.ui.sessions import SessionStore
+
+        store = SessionStore(
+            self.root,
+            legacy_path=self.root / "legacy.json",
+            fallback_path=self.root / "fb.json",
+            ledger_path=self.root / "claims.json",
+        )
+        before = snapshot(self.root)
+        store.save([], "")
+        self.assertTrue((self.root / STORE_DIR_NAME).is_dir())
+
+        after = snapshot(self.root)
+        self.assertEqual(changed_files(before, after), [])
+        self.assertFalse(
+            any(path.startswith(STORE_DIR_NAME) for path in after),
+            "会话文件不应该进入改动快照",
+        )
+
 
 class EditDetailTest(unittest.TestCase):
     def setUp(self) -> None:

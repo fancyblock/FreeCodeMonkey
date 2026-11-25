@@ -24,7 +24,7 @@ from app.core import ProviderManager
 from app.ui import MainWindow
 from app.ui.dialogs import FilePreviewDialog
 from app.ui.dialogs.file_preview_dialog import MAX_PREVIEW_LINES, read_preview
-from app.ui.sessions import SessionStore
+from store_support import workspace_store_factory
 from app.ui.widgets import FileTree
 from app.ui.widgets.file_tree import MAX_TREE_ENTRIES
 
@@ -280,8 +280,9 @@ class MainWindowFileTreeTest(unittest.TestCase):
         )
         settings.workspace_root = str(self.root)
         # 会话存到临时目录，别去碰真实用户数据
-        store = SessionStore(self.root / "sessions.json")
-        self.window = MainWindow(settings, ProviderManager(settings), store)
+        self.window = MainWindow(
+            settings, ProviderManager(settings), workspace_store_factory(self.root)
+        )
 
     def tearDown(self) -> None:
         import app.ui.main_window as window_module
@@ -306,6 +307,20 @@ class MainWindowFileTreeTest(unittest.TestCase):
         top = self.window._file_tree.root_item()
         assert top is not None
         self.assertIn("src/", names(top))
+
+    def test_session_store_dir_is_hidden_from_tree(self) -> None:
+        """会话目录就在工作区里，但不该出现在文件树上。"""
+        from app.constants import STORE_DIR_NAME
+
+        # 有内容写盘之后，这个目录才真正出现在工作区里
+        self.window._chat_view.append_message("user", "一段提问")
+        self.window._save_active_session()
+        self.assertTrue((self.root / STORE_DIR_NAME).is_dir())
+
+        self.window._file_tree.refresh()
+        top = self.window._file_tree.root_item()
+        assert top is not None
+        self.assertNotIn(STORE_DIR_NAME, names(top))
 
     def test_activation_opens_preview(self) -> None:
         self.window._file_tree.file_activated.emit("src/app.py")

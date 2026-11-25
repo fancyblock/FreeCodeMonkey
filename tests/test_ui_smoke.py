@@ -23,7 +23,7 @@ from app.config import Settings
 from app.constants import APP_NAME
 from app.core import ProviderConfig, ProviderManager
 from app.ui import MainWindow
-from app.ui.sessions import SessionStore
+from store_support import workspace_store_factory
 from app.ui.widgets import ApprovalPanel
 
 
@@ -48,8 +48,8 @@ class UiSmokeTest(unittest.TestCase):
     def _make_window(self, settings: Settings) -> MainWindow:
         store_dir = tempfile.TemporaryDirectory()
         type(self)._store_dirs.append(store_dir)
-        store = SessionStore(Path(store_dir.name) / "sessions.json")
-        return MainWindow(settings, ProviderManager(settings), store)
+        factory = workspace_store_factory(Path(store_dir.name))
+        return MainWindow(settings, ProviderManager(settings), factory)
 
     def test_window_builds_without_provider(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

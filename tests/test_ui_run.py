@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import QApplication
 from app.config import Settings
 from app.core import ProviderConfig, ProviderManager, ProviderStore
 from app.ui import MainWindow
-from app.ui.sessions import SessionStore
+from store_support import workspace_store_factory
 from test_agent_loop import ScriptedChatModel, tool_call
 
 ALLOWED = {"value": True}
@@ -58,8 +58,7 @@ class EndToEndTest(unittest.TestCase):
 
         manager = ProviderManager(settings)
         manager.build_model = lambda cfg: model  # 跳过真实 provider
-        store = SessionStore(self.root / "sessions.json")
-        window = MainWindow(settings, manager, store)
+        window = MainWindow(settings, manager, workspace_store_factory(self.root))
         window.show()
         return window
 

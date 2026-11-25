@@ -6,3 +6,7 @@ APP_VERSION = "0.1.0"
 DEFAULT_CONTEXT_WINDOW = 128_000  # 模型上下文窗口缺省值（tokens）
 MAX_WORKSPACE_HISTORY = 20  # 下拉框里最多保留多少个历史工作目录
 MAX_SESSIONS = 100  # 会话列表最多保留多少个，超出丢最旧的
+
+# 会话存放在工作区根目录下的这个隐藏目录里。agent 层的 SKIP_DIRS 与
+# 界面层的会话存储都要用它，所以放在这里，避免任何一层反向依赖另一层。
+STORE_DIR_NAME = ".free-code-monkey"

@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.constants import STORE_DIR_NAME
+
 # 目录噪音：工具遍历与文件树共用这套规则，改动时两边同时生效
 SKIP_DIRS = {
     ".git",
@@ -30,6 +32,8 @@ SKIP_DIRS = {
     "dist",
     "build",
     ".workbuddy",
+    # 会话文件也在工作区里：模型不该读到它，改动快照也不该把它算成「改了文件」
+    STORE_DIR_NAME,
 }
 
 # 某一份快照：工作区相对路径 → (mtime_ns, size)

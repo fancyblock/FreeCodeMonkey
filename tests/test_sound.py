@@ -24,7 +24,7 @@ from app.agent import ApprovalDecision, ApprovalRequest
 from app.config import Settings
 from app.core import ProviderConfig, ProviderManager, ProviderStore
 from app.ui import MainWindow, sound
-from app.ui.sessions import SessionStore
+from store_support import workspace_store_factory
 
 
 class SoundModuleTest(unittest.TestCase):
@@ -117,7 +117,7 @@ class ApprovalSoundTest(unittest.TestCase):
         settings.providers_json = ProviderStore.dumps([config])
         settings.active_provider_id = "p1"
         self.window = MainWindow(
-            settings, ProviderManager(settings), SessionStore(self.root / "s.json")
+            settings, ProviderManager(settings), workspace_store_factory(self.root)
         )
         self.window.show()
 
@@ -217,7 +217,7 @@ class CompletionSoundHookTest(unittest.TestCase):
         settings.providers_json = ProviderStore.dumps([config])
         settings.active_provider_id = "p1"
         self.window = MainWindow(
-            settings, ProviderManager(settings), SessionStore(self.root / "s.json")
+            settings, ProviderManager(settings), workspace_store_factory(self.root)
         )
         self.played: list[bool] = []
 

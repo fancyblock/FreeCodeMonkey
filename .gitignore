@@ -139,3 +139,6 @@ cython_debug/
 
 # WorkBuddy internal data
 .workbuddy/
+
+# 会话文件跟着工作区存放：用本仓库当工作区调试时不想让它进版本库
+.free-code-monkey/
