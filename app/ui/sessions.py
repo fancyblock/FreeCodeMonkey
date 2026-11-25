@@ -51,6 +51,13 @@ def make_title(text: str) -> str:
     return preview or DEFAULT_TITLE
 
 
+def _count(value: object) -> int:
+    """读一个 token 计数；缺失或类型不对都当 0，坏数据不该让会话读不出来。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return max(0, int(value))
+
+
 def same_workspace(workspace: str, root: str | Path) -> bool:
     """会话是否属于某个工作区；Windows 下路径大小写不敏感。"""
     if not workspace:
@@ -171,6 +178,11 @@ class Session:
     entries: list = field(default_factory=list)
     # messages_to_dict 的结果，恢复时直接喂回 agent
     messages: list = field(default_factory=list)
+    # 模型的 token 用量：整个会话的累计，以及最近一轮的（界面显示的是后者）
+    tokens_in: int = 0
+    tokens_out: int = 0
+    last_tokens_in: int = 0
+    last_tokens_out: int = 0
 
     @classmethod
     def create(cls, now: float | None = None, workspace: str = "") -> "Session":
@@ -210,6 +222,10 @@ class Session:
             "workspace": self.workspace,
             "entries": [list(entry) for entry in self.entries],
             "messages": self.messages,
+            "tokens_in": self.tokens_in,
+            "tokens_out": self.tokens_out,
+            "last_tokens_in": self.last_tokens_in,
+            "last_tokens_out": self.last_tokens_out,
         }
 
     @classmethod
@@ -231,6 +247,11 @@ class Session:
             workspace=workspace if isinstance(workspace, str) else "",
             entries=[list(item) for item in entries] if isinstance(entries, list) else [],
             messages=messages if isinstance(messages, list) else [],
+            # 老会话文件里没有这几项，缺省就是 0
+            tokens_in=_count(data.get("tokens_in")),
+            tokens_out=_count(data.get("tokens_out")),
+            last_tokens_in=_count(data.get("last_tokens_in")),
+            last_tokens_out=_count(data.get("last_tokens_out")),
         )
 
 

@@ -17,7 +17,10 @@ from pathlib import Path
 
 from PyQt6.QtCore import QStandardPaths
 
+from app.agent.changes import DELETED, MODIFIED, NEW, as_change
 from app.ui.sessions import DEFAULT_TITLE, Session
+
+_CHANGE_LABEL = {NEW: "新建", MODIFIED: "修改", DELETED: "删除"}
 
 # Windows 文件名里不允许出现的字符，外加控制字符
 _ILLEGAL_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -100,6 +103,29 @@ def _step_markdown(title: str, body: str) -> list[str]:
     return lines
 
 
+def _changes_markdown(payload: object) -> list[str]:
+    """同一条改动清单：标题行 + 每行一个文件。"""
+    if not isinstance(payload, (list, tuple)):
+        return []
+    items = [
+        change
+        for change in (as_change(item) for item in payload)
+        if change is not None
+    ]
+    if not items:
+        return []
+    lines = [f"**本轮文件修改（{len(items)} 个文件）**", ""]
+    for change in items:
+        detail = ""
+        if change.kind == NEW and change.added:
+            detail = f"，新增 {change.added} 行"
+        elif change.kind == MODIFIED and (change.added or change.removed):
+            detail = f"，+{change.added} / −{change.removed} 行"
+        label = _CHANGE_LABEL.get(change.kind, change.kind)
+        lines.append(f"- `{change.path}` · {label}{detail}")
+    return lines
+
+
 def session_to_markdown(session: Session, heading_level: int = 1) -> str:
     """把一个会话渲染成 Markdown 片段。"""
     hashes = "#" * max(1, min(6, heading_level))
@@ -132,6 +158,10 @@ def session_to_markdown(session: Session, heading_level: int = 1) -> str:
             title = "" if len(entry) < 2 or entry[1] is None else str(entry[1])
             body = "" if len(entry) < 3 or entry[2] is None else str(entry[2])
             rendered = _step_markdown(title.strip(), body.rstrip())
+            if rendered:
+                blocks.append("\n".join(rendered))
+        elif kind == "changes" and len(entry) >= 2:
+            rendered = _changes_markdown(entry[1])
             if rendered:
                 blocks.append("\n".join(rendered))
         elif kind == "div":

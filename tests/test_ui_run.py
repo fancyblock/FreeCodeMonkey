@@ -103,6 +103,9 @@ class EndToEndTest(unittest.TestCase):
         self.assertIn("read_file", transcript)
         self.assertIn("edit_file", transcript)
         self.assertIn("已把输出改成 hi", transcript)
+        # 这一轮改过文件，对话最后要列出改动清单
+        self.assertIn("本轮文件修改", transcript)
+        self.assertIn("hello.py", transcript)
         self.assertTrue(window._history)
         # 提交的任务应登记到左侧提示词列表
         self.assertEqual(window._prompt_list.count(), 1)
@@ -131,6 +134,8 @@ class EndToEndTest(unittest.TestCase):
         transcript = window._chat_view.toPlainText()
         self.assertIn("已拒绝", transcript)
         self.assertIn("那我不改了", transcript)
+        # 没有真正写进去，就不该出现改动清单
+        self.assertNotIn("本轮文件修改", transcript)
         window.close()
 
 

@@ -9,6 +9,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor, QTextOption
 from PyQt6.QtWidgets import QTextBrowser, QTextEdit, QWidget
 
+from app.agent.changes import DELETED, MODIFIED, NEW, as_change
 from app.ui.theme import palette
 
 # HTML 片段里只能用字体栈字符串，QFont 下发不到富文本片段
@@ -21,6 +22,11 @@ _TONE_ATTRS = {
     "ok": "success",
     "bad": "danger",
 }
+
+# 改动清单：每多一行就是一次布局，太多会把一轮的结尾撑得很长
+MAX_CHANGE_ROWS = 20
+_CHANGE_SIGN = {NEW: "＋", MODIFIED: "✎", DELETED: "－"}
+_CHANGE_TONE = {NEW: "ok", MODIFIED: "info", DELETED: "bad"}
 
 
 def _tone_color(tone: str) -> str:
@@ -115,6 +121,57 @@ class ChatView(QTextBrowser):
         )
         self._entries.append(("sys", text))
         self._scroll_to_bottom()
+
+    def append_changes(self, changes) -> None:
+        """追加本轮文件改动清单，放在这一轮对话的最后。
+
+        传进来的既可以是 FileChange，也可以是会话记录里存下来的 dict。
+        """
+        items = [change for change in (as_change(item) for item in changes or []) if change]
+        if not items:
+            return
+
+        tokens = palette()
+        html = [
+            '<div style="margin:10px 0 2px 20px;font-size:12px;line-height:165%;">',
+            f'<span style="color:{tokens.text_faint};">'
+            f"本轮文件修改 · {len(items)} 个文件</span>",
+        ]
+        for change in items[:MAX_CHANGE_ROWS]:
+            html.append(self._change_row(change, tokens))
+        if len(items) > MAX_CHANGE_ROWS:
+            html.append(
+                f'<br><span style="color:{tokens.text_faint};">'
+                f"…还有 {len(items) - MAX_CHANGE_ROWS} 个文件</span>"
+            )
+        html.append("</div>")
+        self.append("".join(html))
+        self._entries.append(("changes", [change.to_dict() for change in items]))
+        self._scroll_to_bottom()
+
+    @staticmethod
+    def _change_row(change, tokens) -> str:  # noqa: ANN001 - FileChange / 色板
+        color = _tone_color(_CHANGE_TONE.get(change.kind, "muted"))
+        detail = ""
+        if change.kind == NEW and change.added:
+            detail = (
+                f'<span style="color:{tokens.text_faint};">'
+                f"新增 {change.added} 行</span>"
+            )
+        elif change.kind == MODIFIED and (change.added or change.removed):
+            detail = (
+                f'<span style="color:{tokens.success};">+{change.added}</span> '
+                f'<span style="color:{tokens.danger};">−{change.removed}</span>'
+            )
+        elif change.kind == DELETED:
+            detail = f'<span style="color:{tokens.text_faint};">已删除</span>'
+
+        return (
+            f'<br><span style="color:{color};">{_CHANGE_SIGN.get(change.kind, "·")}</span>'
+            f'<span style="font-family:{_MONO_STACK};color:{tokens.text};">'
+            f" {_escape(change.path)}</span>"
+            f'<span style="margin-left:8px;"> {detail}</span>'
+        )
 
     # ---- agent 步骤 ----
     def append_step(self, title: str, body: str = "", tone: str = "muted") -> None:
@@ -211,6 +268,9 @@ class ChatView(QTextBrowser):
                     self.append_step(
                         "" if entry[1] is None else str(entry[1]), body, tone
                     )
+                elif kind == "changes" and len(entry) >= 2:
+                    payload = entry[1] if isinstance(entry[1], (list, tuple)) else []
+                    self.append_changes(payload)
                 elif kind == "div":
                     self.append_divider()
         finally:

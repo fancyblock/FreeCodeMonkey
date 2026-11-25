@@ -108,7 +108,8 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(model.calls, 1)
         self.assertEqual(len(result), 2)  # HumanMessage + AIMessage
         kinds = [event.kind for event in self.events]
-        self.assertEqual(kinds, [E.STEP, E.CONTEXT, E.DONE])
+        # 每次模型调用后都会报一次本轮累计用量
+        self.assertEqual(kinds, [E.STEP, E.CONTEXT, E.USAGE, E.DONE])
         self.assertIn("你好", self.events[-1].text)
 
     def test_tools_are_registered(self) -> None:

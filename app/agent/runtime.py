@@ -27,9 +27,11 @@ from app.constants import DEFAULT_CONTEXT_WINDOW
 
 from . import events as E
 from .approval import ApprovalChannel, ApprovalDecision, ApprovalRequest
+from .changes import FileChange
 from .events import AgentEvent
 from .prompts import PROMPTS
 from .tools import Workspace
+from .usage import TokenUsage, message_usage
 
 MAX_STEPS = 200
 HISTORY_LIMIT = 40
@@ -243,10 +245,25 @@ class AgentRuntime:
         self._context_budget = context_budget
         self._context_window = context_window if context_window > 0 else DEFAULT_CONTEXT_WINDOW
         self._cancelled = False
+        # 本轮改动了哪些文件：开始执行第一个写/命令工具前拍快照，run() 结束时结算
+        self._baseline: dict[str, tuple[int, int]] | None = None
+        self._changes: list[FileChange] = []
+        # 本轮累计的模型用量：每次调用返回后累加，界面用它更新 token 标签
+        self._usage = TokenUsage()
 
     @property
     def mode(self) -> str:
         return self._mode
+
+    @property
+    def changes(self) -> list[FileChange]:
+        """本轮工作区里被改动过的文件；任务结束后由界面列出来。"""
+        return list(self._changes)
+
+    @property
+    def usage(self) -> TokenUsage:
+        """本轮模型的 token 用量（输入 / 输出各是各次调用的累加）。"""
+        return TokenUsage(**self._usage.to_dict())
 
     def cancel(self) -> None:
         """请求停止：只在两个步骤之间生效，不打断正在执行的命令。"""
@@ -277,59 +294,68 @@ class AgentRuntime:
         )
         bound = self._bind_tools()
 
-        for step in range(1, self._max_steps + 1):
-            if self._cancelled:
-                emit(AgentEvent(E.ERROR, step=step, text="任务已被用户停止", ok=False))
-                return messages[1:]
-
-            emit(AgentEvent(E.STEP, step=step, text=f"第 {step} 步"))
-
-            # 每步调用模型前按字符预算压缩旧工具输出，避免单轮任务撑爆上下文
-            messages = compact_messages(messages, self._context_budget)
-            used_tokens = base_tokens + sum(message_tokens(m) for m in messages)
-            emit(
-                AgentEvent(
-                    E.CONTEXT,
-                    step=step,
-                    used_tokens=int(used_tokens),
-                    window_tokens=self._context_window,
-                )
-            )
-
-            try:
-                reply = bound.invoke(messages)
-            except Exception as exc:  # noqa: BLE001 - 网络/鉴权/超时都归为一类
-                raise RuntimeError(f"模型调用失败：{type(exc).__name__}: {exc}") from exc
-
-            if not isinstance(reply, AIMessage):
-                reply = AIMessage(content=str(reply))
-            messages.append(reply)
-
-            text = content_text(reply.content)
-            tool_calls = list(getattr(reply, "tool_calls", None) or [])
-
-            if not tool_calls:
-                emit(AgentEvent(E.DONE, step=step, text=text or "（模型返回了空回复）"))
-                return messages[1:]
-
-            if text.strip():
-                emit(AgentEvent(E.THOUGHT, step=step, text=text))
-
-            for call in tool_calls:
+        # 每轮重新记改动；成功、失败、被停止都走 finally 结算，界面总能看到动过什么
+        self._baseline = None
+        self._changes = []
+        self._usage = TokenUsage()
+        self._workspace.reset_edits()
+        try:
+            for step in range(1, self._max_steps + 1):
                 if self._cancelled:
                     emit(AgentEvent(E.ERROR, step=step, text="任务已被用户停止", ok=False))
                     return messages[1:]
-                self._handle_call(call, step, messages, emit)
 
-        emit(
-            AgentEvent(
-                E.ERROR,
-                step=self._max_steps,
-                text=f"已达到最大步数 {self._max_steps}，任务可能未完成。可以补充要求后重新发送。",
-                ok=False,
+                emit(AgentEvent(E.STEP, step=step, text=f"第 {step} 步"))
+
+                # 每步调用模型前按字符预算压缩旧工具输出，避免单轮任务撑爆上下文
+                messages = compact_messages(messages, self._context_budget)
+                used_tokens = base_tokens + sum(message_tokens(m) for m in messages)
+                emit(
+                    AgentEvent(
+                        E.CONTEXT,
+                        step=step,
+                        used_tokens=int(used_tokens),
+                        window_tokens=self._context_window,
+                    )
+                )
+
+                try:
+                    reply = bound.invoke(messages)
+                except Exception as exc:  # noqa: BLE001 - 网络/鉴权/超时都归为一类
+                    raise RuntimeError(f"模型调用失败：{type(exc).__name__}: {exc}") from exc
+
+                if not isinstance(reply, AIMessage):
+                    reply = AIMessage(content=str(reply))
+                messages.append(reply)
+                self._account_usage(reply, int(used_tokens), step, emit)
+
+                text = content_text(reply.content)
+                tool_calls = list(getattr(reply, "tool_calls", None) or [])
+
+                if not tool_calls:
+                    emit(AgentEvent(E.DONE, step=step, text=text or "（模型返回了空回复）"))
+                    return messages[1:]
+
+                if text.strip():
+                    emit(AgentEvent(E.THOUGHT, step=step, text=text))
+
+                for call in tool_calls:
+                    if self._cancelled:
+                        emit(AgentEvent(E.ERROR, step=step, text="任务已被用户停止", ok=False))
+                        return messages[1:]
+                    self._handle_call(call, step, messages, emit)
+
+            emit(
+                AgentEvent(
+                    E.ERROR,
+                    step=self._max_steps,
+                    text=f"已达到最大步数 {self._max_steps}，任务可能未完成。可以补充要求后重新发送。",
+                    ok=False,
+                )
             )
-        )
-        return messages[1:]
+            return messages[1:]
+        finally:
+            self._changes = self._collect_changes()
 
     # ---- 内部 ----
     def _bind_tools(self):
@@ -379,8 +405,10 @@ class AgentRuntime:
                     )
                 )
                 return
+            self._prepare_write(tool)
             result = self._workspace.call(name, args)
         else:
+            self._prepare_write(tool)
             result = self._workspace.call(name, args)
 
         emit(
@@ -393,6 +421,47 @@ class AgentRuntime:
             )
         )
         messages.append(ToolMessage(content=result, tool_call_id=call_id))
+
+    def _account_usage(
+        self,
+        reply: AIMessage,
+        prompt_tokens: int,
+        step: int,
+        emit: Callable[[AgentEvent], None],
+    ) -> None:
+        """累加这次调用的 token 并把本轮合计报给界面。
+
+        provider 不给用量时按字符估算：输入用调用前算出的 prompt 估算值，
+        输出用这条回复正文加工具参数。
+        """
+        usage = message_usage(reply)
+        if usage is None:
+            self._usage.add(prompt_tokens, int(message_tokens(reply)), approximate=True)
+        else:
+            self._usage.add(*usage)
+        emit(
+            AgentEvent(
+                E.USAGE,
+                step=step,
+                input_tokens=self._usage.input_tokens,
+                output_tokens=self._usage.output_tokens,
+                approximate=self._usage.approximate,
+            )
+        )
+
+    def _prepare_write(self, tool) -> None:  # noqa: ANN001 - Tool，避免多一层 import
+        """执行写文件 / 命令类工具前拍一次快照：之后的变化都算这一轮的改动。"""
+        if tool.danger and self._baseline is None:
+            self._baseline = self._workspace.snapshot()
+
+    def _collect_changes(self) -> list[FileChange]:
+        """结算本轮改动；读盘失败时宁可不列，也不能盖掉任务本身的结果。"""
+        if self._baseline is None:
+            return []
+        try:
+            return self._workspace.file_changes(self._baseline)
+        except OSError:
+            return []
 
     def _ask(self, tool_name: str, args: dict[str, Any]) -> ApprovalDecision:
         request = ApprovalRequest(

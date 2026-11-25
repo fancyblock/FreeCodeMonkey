@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.agent import ApprovalRequest
+from app.agent.usage import APPROXIMATE_MARK, compact_tokens
 from app.constants import DEFAULT_CONTEXT_WINDOW
 from app.ui.icons import icon
 from app.ui.theme import context_level, palette, repolish
@@ -26,6 +27,9 @@ _MODE_OPTIONS = (
     ("build", "Build", "可写：直接修改代码并执行命令，危险操作会弹窗确认"),
 )
 _DEFAULT_MODE = "build"
+
+# 还没有任何一轮的用量时的占位，保持标签常驻，避免布局跳动
+_TOKEN_PLACEHOLDER = "—"
 
 
 class _PromptEdit(QPlainTextEdit):
@@ -56,6 +60,7 @@ class PromptInput(QWidget):
         self._edit = _PromptEdit()
         self._mode_combo = QComboBox()
         self._context_bar = QProgressBar()
+        self._token_label = QLabel()
         self._used_tokens = 0
         self._window_tokens = DEFAULT_CONTEXT_WINDOW
         self._send_button = QPushButton("发送 (Ctrl+Enter)")
@@ -94,11 +99,16 @@ class PromptInput(QWidget):
         self._context_bar.setMaximumHeight(18)
         self._context_bar.setToolTip("上下文占用：尚无请求")
 
+        # token 标签紧挨在进度条左边：先读「这次花了多少」，再看「窗口还剩多少」
+        self._token_label.setProperty("role", "caption")
+        self._update_token_label(0, 0, 0, 0, approximate=False)
+
         buttons = QHBoxLayout()
         buttons.addWidget(QLabel("Agent："))
         buttons.addWidget(self._mode_combo)
         buttons.addWidget(self._new_session_button)
         buttons.addStretch(1)
+        buttons.addWidget(self._token_label)
         buttons.addWidget(self._context_bar)
         buttons.addWidget(self._stop_button)
         buttons.addWidget(self._send_button)
@@ -166,6 +176,60 @@ class PromptInput(QWidget):
     def reset_context(self) -> None:
         self._used_tokens = 0
         self.set_context_usage(0, self._window_tokens)
+
+    # ---- token 用量 ----
+    def set_token_usage(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        *,
+        session_in: int | None = None,
+        session_out: int | None = None,
+        approximate: bool = False,
+    ) -> None:
+        """更新进度条左边的 token 标签：显示这一轮，悬停看会话累计。
+
+        ``session_in`` / ``session_out`` 不传时按「本轮即累计」处理。
+        """
+        self._update_token_label(
+            max(0, int(input_tokens)),
+            max(0, int(output_tokens)),
+            max(0, int(input_tokens if session_in is None else session_in)),
+            max(0, int(output_tokens if session_out is None else session_out)),
+            approximate=approximate,
+        )
+
+    def token_label_text(self) -> str:
+        """标签当前显示的内容，测试与调试用。"""
+        return self._token_label.text()
+
+    def _update_token_label(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        session_in: int,
+        session_out: int,
+        *,
+        approximate: bool,
+    ) -> None:
+        if input_tokens or output_tokens:
+            mark = APPROXIMATE_MARK if approximate else ""
+            round_text = (
+                f"↑ {mark}{compact_tokens(input_tokens)}  ↓ {mark}{compact_tokens(output_tokens)}"
+            )
+        else:
+            round_text = f"↑ {_TOKEN_PLACEHOLDER}  ↓ {_TOKEN_PLACEHOLDER}"
+        self._token_label.setText(round_text)
+
+        hint = f"本会话累计：输入 {session_in:,} · 输出 {session_out:,} tokens"
+        if input_tokens or output_tokens:
+            hint = (
+                f"本轮：输入 {input_tokens:,} · 输出 {output_tokens:,} tokens"
+                f"（合计 {input_tokens + output_tokens:,}）\n{hint}"
+            )
+        if approximate:
+            hint += "\n当前模型未回报用量，数字为按字符估算"
+        self._token_label.setToolTip(hint)
 
     def clear(self) -> None:
         self._edit.clear()

@@ -17,26 +17,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from .changes import SKIP_DIRS, FileChange, changed_files, snapshot
+
 MAX_READ_LINES = 400
 MAX_LIST_ENTRIES = 300
 MAX_GREP_LINES = 80
 MAX_OUTPUT_CHARS = 12000
 MAX_FILE_BYTES = 2 * 1024 * 1024
-
-SKIP_DIRS = {
-    ".git",
-    ".venv",
-    "venv",
-    "__pycache__",
-    "node_modules",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".idea",
-    ".vscode",
-    "dist",
-    "build",
-    ".workbuddy",
-}
 
 DANGER_WRITE = "write"
 DANGER_EXEC = "exec"
@@ -115,6 +102,9 @@ class Workspace:
         if read_only:
             tools = [tool for tool in tools if not tool.requires_approval]
         self._tools: list[Tool] = tools
+        # edit_file 的增删行数：相对路径 → (新增行, 删除行)，供任务结束时的
+        # 改动清单补充细节；真正哪些文件变了由快照差异决定。
+        self._edits: dict[str, tuple[int, int]] = {}
 
     @property
     def root(self) -> Path:
@@ -194,6 +184,23 @@ class Workspace:
             dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
             for name in sorted(filenames):
                 yield Path(dirpath) / name
+
+    # ---- 改动记录 ----
+    def snapshot(self) -> dict[str, tuple[int, int]]:
+        """拍一份文件快照；runtime 用开始/结束两份快照算这一轮改了什么。"""
+        return snapshot(self._root)
+
+    def reset_edits(self) -> None:
+        """开始新的一轮：清掉上一轮留下的编辑明细。"""
+        self._edits.clear()
+
+    def file_changes(self, before: dict[str, tuple[int, int]]) -> list[FileChange]:
+        """按快照差异汇总本轮改动，并补上 edit_file 记下的行数。"""
+        return changed_files(before, snapshot(self._root), self._edits)
+
+    def _note_edit(self, rel_path: str, added: int, removed: int) -> None:
+        previous = self._edits.get(rel_path, (0, 0))
+        self._edits[rel_path] = (previous[0] + added, previous[1] + removed)
 
     # ---- 工具实现 ----
     def _read_file(self, args: dict[str, Any]) -> str:
@@ -360,7 +367,9 @@ class Workspace:
                 path.write_text(new_string, encoding="utf-8")
             except OSError as exc:
                 raise ToolError(f"新建失败：{exc}") from exc
-            return f"已新建 {self._rel(path)}（{len(new_string.splitlines())} 行）"
+            lines = len(new_string.splitlines())
+            self._note_edit(self._rel(path), lines, 0)
+            return f"已新建 {self._rel(path)}（{lines} 行）"
 
         if path.is_dir():
             raise ToolError(f"{self._rel(path)} 是目录，不能编辑")
@@ -392,6 +401,7 @@ class Workspace:
 
         old_lines = len(old_string.splitlines())
         new_lines = len(new_string.splitlines())
+        self._note_edit(self._rel(path), new_lines, old_lines)
         delta = new_lines - old_lines
         sign = f"{delta:+d}" if delta else "±0"
         return f"已修改 {self._rel(path)}（行数 {sign}，当前 {len(updated.splitlines())} 行）"

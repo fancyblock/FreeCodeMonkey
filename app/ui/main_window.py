@@ -565,6 +565,13 @@ class MainWindow(QMainWindow):
         self._history = session.history()
         self._files_changed = False
         self._prompt_input.reset_context()
+        # 进度条左边的 token 标签跟着换：这一轮多少 + 整个会话多少
+        self._prompt_input.set_token_usage(
+            session.last_tokens_in,
+            session.last_tokens_out,
+            session_in=session.tokens_in,
+            session_out=session.tokens_out,
+        )
         self._session_list.select(session.id)
 
     def _save_active_session(self, touch: bool = True) -> None:
@@ -817,6 +824,11 @@ class MainWindow(QMainWindow):
         # 立刻存档：标题跟着第一条消息定下来，任务中途崩掉也不至于丢掉提问
         self._save_active_session()
         self._files_changed = False
+        # 新一轮从 0 起算，免得标签上一直挂着上一轮的数字
+        session = self._active_session()
+        self._prompt_input.set_token_usage(
+            0, 0, session_in=session.tokens_in, session_out=session.tokens_out
+        )
         self._prompt_input.clear()
         self._prompt_input.set_running(True)
         self.statusBar().showMessage(f"正在调用 {config.name}（{mode}）…")
@@ -838,8 +850,13 @@ class MainWindow(QMainWindow):
 
         handle = run_in_thread(runtime.run, task, list(self._history), bridge.agent_event.emit)
         self._active_handles.append(handle)
-        handle.worker.result.connect(lambda messages: self._on_run_done(messages, handle))
-        handle.worker.failed.connect(lambda msg: self._on_run_failed(msg, handle))
+        # 把 runtime 一起传给回调：本轮的文件改动清单由它结算，别依赖 self._runtime
+        handle.worker.result.connect(
+            lambda messages: self._on_run_done(messages, handle, runtime)
+        )
+        handle.worker.failed.connect(
+            lambda message: self._on_run_failed(message, handle, runtime)
+        )
         # 线程生命周期归界面管：只有 finished 之后才允许释放句柄，
         # 提前释放会让 PyQt 销毁运行中的 QThread，进程直接崩掉。
         handle.thread.finished.connect(self._on_thread_finished)
@@ -927,6 +944,15 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("你拒绝了一个操作")
         elif kind == E.CONTEXT:
             self._prompt_input.set_context_usage(event.used_tokens, event.window_tokens)
+        elif kind == E.USAGE:
+            session = self._active_session()
+            self._prompt_input.set_token_usage(
+                event.input_tokens,
+                event.output_tokens,
+                session_in=session.tokens_in + event.input_tokens,
+                session_out=session.tokens_out + event.output_tokens,
+                approximate=event.approximate,
+            )
         elif kind == E.DONE:
             self._chat_view.append_message("assistant", event.text)
             self.statusBar().showMessage("就绪")
@@ -934,22 +960,52 @@ class MainWindow(QMainWindow):
             self._chat_view.append_system(event.text)
             self.statusBar().showMessage("出错")
 
-    def _on_run_done(self, messages: list[BaseMessage], handle) -> None:
+    def _on_run_done(self, messages: list[BaseMessage], handle, runtime=None) -> None:
         self._history = trim_history(list(messages))
         self._refresh_tree_if_changed()
+        self._append_changes(runtime)
+        self._record_usage(runtime)
         self._save_active_session()
         self._finish_task("就绪")
         # 提示音 + 任务栏闪烁：任务跑完时提醒你回来看结果
         sound.play_completion()
         attention.flash(self)
 
-    def _on_run_failed(self, message: str, handle) -> None:
+    def _on_run_failed(self, message: str, handle, runtime=None) -> None:
         self._chat_view.append_system(f"错误：{message}")
         self._refresh_tree_if_changed()
+        self._append_changes(runtime)
+        self._record_usage(runtime)
         self._save_active_session()
         self._finish_task("出错")
         # 任务被错误打断，同样要招手：用户可能正等着它跑完
         attention.flash(self)
+
+    def _record_usage(self, runtime=None) -> None:
+        """把这一轮的模型用量并进会话：累计加一遍，另存一份「最近一轮」。"""
+        source = runtime if runtime is not None else self._runtime
+        usage = source.usage if source is not None else None
+        if usage is None or not usage.total:
+            return
+        session = self._active_session()
+        session.tokens_in += usage.input_tokens
+        session.tokens_out += usage.output_tokens
+        session.last_tokens_in = usage.input_tokens
+        session.last_tokens_out = usage.output_tokens
+        self._prompt_input.set_token_usage(
+            usage.input_tokens,
+            usage.output_tokens,
+            session_in=session.tokens_in,
+            session_out=session.tokens_out,
+            approximate=usage.approximate,
+        )
+
+    def _append_changes(self, runtime=None) -> None:
+        """把本轮改动过的文件列在对话的最后；整轮没动过文件就什么都不加。"""
+        source = runtime if runtime is not None else self._runtime
+        changes = source.changes if source is not None else []
+        if changes:
+            self._chat_view.append_changes(changes)
 
     def _refresh_tree_if_changed(self) -> None:
         """只有 agent 真的改过文件才重建文件树，纯读任务不动它。"""
@@ -1014,11 +1070,14 @@ class MainWindow(QMainWindow):
         self._prompt_list.clear_prompts()
         self._prompt_input.reset_context()
         self._chat_view.clear_history()
-        # 内容清空了，标题也要跟着回到默认值
+        # 内容清空了，标题也要跟着回到默认值；用量归零，下一轮重新累计
         session = self._active_session()
         session.title = DEFAULT_TITLE
         session.entries = []
         session.set_history([])
+        session.tokens_in = session.tokens_out = 0
+        session.last_tokens_in = session.last_tokens_out = 0
+        self._prompt_input.set_token_usage(0, 0, session_in=0, session_out=0)
         self._sync_session_list()
         self._session_store.save(self._sessions, self._active_session_id)
 

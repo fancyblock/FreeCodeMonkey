@@ -4,6 +4,7 @@
 """
 
 from .approval import ApprovalChannel, ApprovalDecision, ApprovalRequest
+from .changes import FileChange
 from .events import AgentEvent
 from .runtime import AgentRuntime
 from .tools import Tool, ToolError, Workspace
@@ -14,6 +15,7 @@ __all__ = [
     "ApprovalChannel",
     "ApprovalDecision",
     "ApprovalRequest",
+    "FileChange",
     "Tool",
     "ToolError",
     "Workspace",

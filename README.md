@@ -19,7 +19,12 @@
 - ReAct 循环，单轮最多 200 步；同一操作连续失败两次，提示词要求模型换思路。
 - **Plan / Build**：输入框左侧可切换模式，Plan 只暴露只读工具（读文件、列目录、搜代码），先出修改计划；Build 才能改文件、跑命令。
 - **上下文占用条**：发送按钮左侧实时显示本次请求的估算 token 占模型上下文窗口的比例，≥60% 变橙、≥85% 变红。
+- **token 用量**：进度条左边显示这一轮模型的输入 / 输出 token（`↑ 12.3k ↓ 1.8k`），
+  悬停看本轮明细与会话累计；换会话时跟着换成那一轮的。数值取 provider 回报的用量，
+  模型不回报时按字符估算并加 `≈`。累计随会话存盘，关掉程序再打开还在。
 - 每次工具调用都以步骤行形式出现在对话区，你能看清它在做什么。
+- **本轮文件修改**：这一轮改过文件（`edit_file` 写入、或 `run_command` 生成/删除的），
+  结束时会在对话最后列出清单：新建 / 修改 / 删除的路径与行数变化。整轮没动过文件就不显示。
 - **多会话**：左侧「会话」列表保存当前工作区的所有会话，双击切换到某一轮；切换时对话区、
   提示词列表和 agent 的记忆一起换成那一轮的。输入框左下「新建会话」开一段新对话，
   旧的留在列表里随时切回；右键某一项可以删除（会先确认）。会话会存到本地，
@@ -56,6 +61,8 @@ app/
 ├── agent/                       ★ 编程智能体（不依赖 Qt，可无界面运行）
 │   ├── events.py                事件定义（步骤/工具/结果/结束）
 │   ├── approval.py              审批协议 + 测试用放行/拒绝通道
+│   ├── changes.py               一轮任务的文件改动（快照差异 + edit_file 行数）
+│   ├── usage.py                 读取模型回报的 token 用量，缺省时按字符估算
 │   ├── tools.py                 8 个工具与工作区路径约束
 │   ├── syntax.py                tree-sitter 解析：outline/read_symbol/syntax_check
 │   ├── prompts.py               系统提示词（行为纪律）
@@ -184,6 +191,8 @@ python -m venv .venv
 .venv\Scripts\python.exe tests\test_ui_smoke.py      # 界面装配，offscreen，不需要显示器
 .venv\Scripts\python.exe tests\test_ui_run.py        # 端到端：线程 → 审批 → 回灌 → 渲染
 .venv\Scripts\python.exe tests\test_file_tree.py     # 文件树懒加载与预览弹窗
+.venv\Scripts\python.exe tests\test_changes.py       # 本轮文件改动：快照差异、清单展示与导出
+.venv\Scripts\python.exe tests\test_usage.py         # token 用量：读取、累加、标签与会话存盘
 .venv\Scripts\python.exe tests\test_attention.py     # 任务栏闪烁：何时闪、何时不闪
 ```
 
