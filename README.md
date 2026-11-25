@@ -36,8 +36,9 @@
 - 左侧文件树只读：目录展开时才读盘，双击文件看带行号的内容。它不做改名或删除，
   写操作仍然只走 agent 的审批通道；agent 改过文件的任务结束后，树会自动刷新。
 - 随时可以点「停止」，在两个步骤之间生效。
-- 声音提醒：任务跑完播 `sound/mission_complete_strong_2s.mp3`，需要你确认时
-  播 `sound/question_confirmation_strong_1_5s.mp3`，不用一直盯着屏幕等。
+- 声音与任务栏提醒：任务跑完播 `sound/mission_complete_strong_2s.mp3`，需要你确认时
+  播 `sound/question_confirmation_strong_1_5s.mp3`；窗口不在前台时任务栏按钮会一直闪，
+  直到切回窗口（Windows），任务出错中断同样会闪——不用一直盯着屏幕等。
 
 #### 软件架构
 
@@ -69,6 +70,7 @@ app/
     ├── assets/                  app_icon.ico（多尺寸）与 app_icon.png
     ├── sessions.py              ★ 会话模型与 JSON 持久化
     ├── sound.py                 界面提示音：任务完成 / 需要确认（QMediaPlayer）
+    ├── attention.py             任务栏闪烁：完成 / 待确认 / 出错时招手（FlashWindowEx）
     ├── export.py                会话导出为 Markdown
     ├── widgets/                 对话视图（含步骤流）、文件树、会话列表、提示词列表、
     │                            输入区（含危险操作确认卡）
@@ -182,6 +184,7 @@ python -m venv .venv
 .venv\Scripts\python.exe tests\test_ui_smoke.py      # 界面装配，offscreen，不需要显示器
 .venv\Scripts\python.exe tests\test_ui_run.py        # 端到端：线程 → 审批 → 回灌 → 渲染
 .venv\Scripts\python.exe tests\test_file_tree.py     # 文件树懒加载与预览弹窗
+.venv\Scripts\python.exe tests\test_attention.py     # 任务栏闪烁：何时闪、何时不闪
 ```
 
 `test_ui_run.py` 里唯一被替换的是模型，线程、跨线程信号、确认卡交互、事件渲染都是真的。

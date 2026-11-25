@@ -43,7 +43,7 @@ from app.constants import (
     MAX_WORKSPACE_HISTORY,
 )
 from app.core import ProviderManager, get_spec
-from app.ui import sound
+from app.ui import attention, sound
 from app.ui.agent_bridge import AgentBridge
 from app.ui.dialogs import FilePreviewDialog, SettingsDialog
 from app.ui.export import (
@@ -850,8 +850,9 @@ class MainWindow(QMainWindow):
     @pyqtSlot(object)
     def _on_approval_requested(self, request: ApprovalRequest) -> None:
         """把待确认的调用摆到输入区，任务线程继续在后台等着。"""
-        # 任务在后台跑，用户可能没盯着屏幕；卡片出现前先响一声
+        # 任务在后台跑，用户可能没盯着屏幕：先响一声，任务栏按钮也跟着闪
         sound.play_confirmation()
+        attention.flash(self)
         self._prompt_input.show_approval(request)
         self._fit_input_pane()
         self.statusBar().showMessage(f"等待你确认 {request.tool}…")
@@ -867,6 +868,8 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str, str)
     def _on_approval_expired(self, request_id: str, reason: str) -> None:
         """请求已失效（超时或任务被中止）：收起卡片，别让界面停在旧请求上。"""
+        # 卡片都没了，闪烁也没了意义，别让任务栏继续招人
+        attention.stop(self)
         self._prompt_input.clear_approval(request_id)
         self._restore_input_pane()
         self.statusBar().showMessage(reason)
@@ -936,14 +939,17 @@ class MainWindow(QMainWindow):
         self._refresh_tree_if_changed()
         self._save_active_session()
         self._finish_task("就绪")
-        # 提示音：任务跑完时提醒你回来看结果
+        # 提示音 + 任务栏闪烁：任务跑完时提醒你回来看结果
         sound.play_completion()
+        attention.flash(self)
 
     def _on_run_failed(self, message: str, handle) -> None:
         self._chat_view.append_system(f"错误：{message}")
         self._refresh_tree_if_changed()
         self._save_active_session()
         self._finish_task("出错")
+        # 任务被错误打断，同样要招手：用户可能正等着它跑完
+        attention.flash(self)
 
     def _refresh_tree_if_changed(self) -> None:
         """只有 agent 真的改过文件才重建文件树，纯读任务不动它。"""
